@@ -1,0 +1,117 @@
+# SPDX-License-Identifier: Apache-2.0
+# Multi-attribute negotiation market over THREE attributes -- PRICE + DEADLINE + QUANTITY
+# (Problem-07, PASS demo): the PAYMENT-window reading of `deadline` plus an OPPOSED
+# `quantity` axis under a TOTAL (lump-sum) price. All three attributes are opposed.
+#
+# Direction signs (all three opposed):
+#   price    -- TOTAL contract price [300,1000]: buyer wants it LOW (-1), seller HIGH (+1).
+#   deadline -- PAYMENT/SETTLEMENT window [1,30] days (net-30/60): buyer wants it LONG (+1,
+#               keep cash longer), seller SHORT (-1, collect sooner). These are the factory
+#               DEFAULT deadline signs (no override needed).
+#   quantity -- units [10,100]: under a TOTAL price, more units for the same lump sum helps
+#               the buyer (+1) and hurts the seller (-1) -> OPPOSED. (Under a UNIT price the
+#               seller would want more too -> congruent; that congruent reading is covered as
+#               a robustness UNIT test, not a scenario, because a common-interest axis has a
+#               degenerate frontier.)
+#
+# Because the attribute vector INCLUDES `deadline`, the per-pair weight split is byte-identical
+# to the 2-attr base draw (deadline owns the price-complement); `quantity` draws its own
+# asymmetric weight AFTER, so the buyer holds quantity (won't give units away) and the seller
+# concedes it cheaply -- the logrolling chip, mirroring how `quality` logrolls in the
+# price+deadline+quality scenario. The ChainAim plugin drives BOTH sides over the full
+# price x deadline x quantity grid; agreements reach the epsilon-Pareto frontier (a small
+# honest residual is expected -- that is exactly what the rig quantifies). Verify with
+# `nest validate ./traces/multi_attribute_market_3attr_price_deadline_quantity.jsonl --scenario negotiation --metrics`.
+#
+# `quantity_prefix: n` is set explicitly to avoid the single-letter wire collision with
+# `quality` (both default to `q`): offers carry `:n<quantity>`, the profile discloses
+# wn / nmin / nmax / dir_n.
+name: multi_attribute_market_3attr_price_deadline_quantity
+description: "10 buyer/seller pairs, price+deadline(payment)+quantity (all opposed), ChainAim Pareto plugin (3-attr PASS demo)."
+
+tier: 1
+seed: 42
+
+agents:
+  count: 20
+  brain: state-machine
+  roles:
+    - name: buyer
+      count: 10
+    - name: seller
+      count: 10
+
+layers:
+  transport: in_memory
+  comms: nest_native
+  identity: did_key
+  registry: in_memory
+  auth: jwt
+  trust: score_average
+  payments: prepaid_credits
+  coordination: contract_net
+  negotiation: chainaim_neg_multi_pareto
+  memory: blackboard
+  privacy: noop
+  datafacts: datafacts_v1
+
+task:
+  type: negotiation_multi
+  config:
+    # --- the attribute vector (third attribute `quantity`) ---
+    attributes: [price, deadline, quantity]
+
+    # --- price: TOTAL contract price (lump sum), not per-unit ---
+    price_min: 300          # shared TOTAL-price bounds
+    price_max: 1000
+    buyer_open_price: 300   # buyer opens cheap (its ideal total)
+    seller_anchor: 995      # seller opens dear
+    buyer_target: 700       # naive price meeting points (self-concession fallback only)
+    seller_target: 600
+    price_step: 50          # naive concession size per round (scaled to the [300,1000] range)
+
+    # --- deadline: PAYMENT/SETTLEMENT window (default signs: buyer +1 long / seller -1 short) ---
+    deadline_min: 1         # shared deadline bounds (days)
+    deadline_max: 30
+    buyer_open_deadline: 30 # buyer opens long (buyer values a long settlement window)
+    naive_deadline: 15      # mid window used by price-only self-concession / seller open
+
+    patience: 0.9           # plugin aspiration discount
+    max_rounds: 12          # per-session safety cap
+    # grid_points left at the plugin default (15) -- see the price+deadline+quality scenario
+    # note: a finer grid did not reach the exact frontier and cost ~9x for a worse epsilon.
+
+    # --- quantity: the third attribute, OPPOSED (generic <attr>_* schema read by the factory) ---
+    quantity_min: 10        # units bounds [10, 100]
+    quantity_max: 100
+    quantity_prefix: n      # wire prefix -> offers carry `:n<quantity>`; profile discloses
+                            #   wn / nmin / nmax / dir_n (avoids the q-collision with quality)
+    buyer_dir:              # per-attribute direction overlay (price/deadline keep defaults)
+      quantity: 1           #   buyer: MORE units is better (cheaper per unit under a total price)
+    seller_dir:
+      quantity: -1          #   seller: FEWER units is better (less to produce for the same sum)
+    # ASYMMETRIC quantity weights -- the logrolling chip (mirrors the quality scenario):
+    #   buyer weights quantity HIGH (won't give units away -> concedes the settlement window),
+    #   seller weights quantity LOW (concedes units freely; price+window are its complement).
+    buyer_w_quantity_range: [0.30, 0.40]
+    seller_w_quantity_range: [0.05, 0.12]
+    quantity_open_buyer: 100  # buyer opens at its quantity ideal (many)
+    quantity_open_seller: 10  # seller opens at its quantity ideal (few)
+    quantity_concede: pin     # self-concession fallback pins quantity; the plugin's frontier
+                              #   walk does the real trading (same discipline as deadline/quality)
+    # NOTE: buyer_w_price / seller_w_price intentionally unset -- per-pair price/deadline
+    # weights are seeded from `seed` (buyer price-heavy / seller deadline-heavy ranges),
+    # so the 10 pairs differ yet replay deterministically.
+
+failures:
+  message_drop: 0.0
+
+duration: "ticks: 10000"
+
+metrics:
+  - success_rate
+  - mean_latency
+  - message_count
+
+output:
+  trace: ./traces/multi_attribute_market_3attr_price_deadline_quantity.jsonl

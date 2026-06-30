@@ -1,0 +1,7 @@
+# Golden negotiation trace fixtures are byte-stable regression references.
+# Pin to LF so they are identical on every platform and are never rewritten by a
+# contributor's local core.autocrlf setting (which would otherwise dirty the
+# working tree and churn the committed blob on Windows, where the trace is
+# generated with CRLF). The byte-golden test reads via universal newlines, so
+# this affects only the on-disk/committed form, never the PASS/FAIL verdict.
+*.jsonl text eol=lf

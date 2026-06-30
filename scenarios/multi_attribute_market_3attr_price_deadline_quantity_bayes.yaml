@@ -1,0 +1,105 @@
+# SPDX-License-Identifier: Apache-2.0
+# Multi-attribute negotiation market over THREE attributes (price+deadline+quantity) --
+# BAYESIAN opponent model. Byte-for-byte identical to
+# `multi_attribute_market_3attr_price_deadline_quantity.yaml` (payment window + opposed
+# quantity, total price) EXCEPT it selects the Bayesian
+# opponent-weight estimator (Mechanism B) via `opponent_model: bayesian`. This is the
+# deliberate A/B twin of the heuristic price+deadline+quantity scenario: same seed, same agents, same attribute
+# vector and weights, so any difference in the agreement set / pareto_dist is attributable
+# ONLY to how each side INFERS the opponent's private weights -- concession-pattern heuristic
+# vs deterministic grid-posterior over the (n-1)-simplex.
+#
+# COST NOTE: Bayesian 3-attr is compute-heavy (a partition function over the full
+# price x deadline x quantity grid per weight hypothesis, per offer, per round). A full
+# 10-pair run may take ~1-3 minutes; lower `bayes_grid_points` to trade fidelity for speed.
+#
+# Verify with `nest validate ./traces/multi_attribute_market_3attr_price_deadline_quantity_bayes.jsonl \
+#   --scenario negotiation --metrics`, and compare pareto_dist against the heuristic run.
+name: multi_attribute_market_3attr_price_deadline_quantity_bayes
+description: "10 buyer/seller pairs, price+deadline(payment)+quantity (all opposed), ChainAim Pareto plugin, BAYESIAN opponent model (3-attr A/B twin)."
+
+tier: 1
+seed: 42
+
+agents:
+  count: 20
+  brain: state-machine
+  roles:
+    - name: buyer
+      count: 10
+    - name: seller
+      count: 10
+
+layers:
+  transport: in_memory
+  comms: nest_native
+  identity: did_key
+  registry: in_memory
+  auth: jwt
+  trust: score_average
+  payments: prepaid_credits
+  coordination: contract_net
+  negotiation: chainaim_neg_multi_pareto
+  memory: blackboard
+  privacy: noop
+  datafacts: datafacts_v1
+
+task:
+  type: negotiation_multi
+  config:
+    # --- Mechanism B selector: the ONLY change from the heuristic price+deadline+quantity scenario ---
+    opponent_model: bayesian
+    # Optional Bayesian tuning (defaults shown). Lower bayes_grid_points to speed up:
+    # bayes_grid_points: 11   # simplex resolution m = K-1; 21 (default) -> 231 hyps at n=3
+    # bayes_beta: 4.0         # Boltzmann inverse-temperature (assumed opponent rationality)
+    # bayes_warmup: 0         # offers to observe before updating (0 = update from first)
+
+    # --- the attribute vector (third attribute `quantity`) ---
+    attributes: [price, deadline, quantity]
+
+    # --- price: TOTAL contract price (lump sum), not per-unit ---
+    price_min: 300
+    price_max: 1000
+    buyer_open_price: 300
+    seller_anchor: 995
+    buyer_target: 700
+    seller_target: 600
+    price_step: 50
+
+    # --- deadline: PAYMENT/SETTLEMENT window (default signs: buyer +1 long / seller -1 short) ---
+    deadline_min: 1
+    deadline_max: 30
+    buyer_open_deadline: 30
+    naive_deadline: 15
+
+    patience: 0.9
+    max_rounds: 12
+
+    # --- quantity: the third attribute, OPPOSED ---
+    quantity_min: 10
+    quantity_max: 100
+    quantity_prefix: n      # offers carry `:n<quantity>`; profile discloses wn/nmin/nmax/dir_n
+    buyer_dir:
+      quantity: 1           #   buyer: MORE units is better
+    seller_dir:
+      quantity: -1          #   seller: FEWER units is better
+    buyer_w_quantity_range: [0.30, 0.40]
+    seller_w_quantity_range: [0.05, 0.12]
+    quantity_open_buyer: 100
+    quantity_open_seller: 10
+    quantity_concede: pin
+    # NOTE: buyer_w_price / seller_w_price unset -> per-pair weights seeded from `seed`,
+    # identical to the heuristic twin so the A/B isolates only the opponent model.
+
+failures:
+  message_drop: 0.0
+
+duration: "ticks: 10000"
+
+metrics:
+  - success_rate
+  - mean_latency
+  - message_count
+
+output:
+  trace: ./traces/multi_attribute_market_3attr_price_deadline_quantity_bayes.jsonl

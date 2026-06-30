@@ -129,3 +129,13 @@ def _try_load_builtin(name: str) -> None:
         )
 
         register_scenario("failure_detection", failure_detection_factory)
+    elif name == "negotiation":
+        from nest_core.scenarios_builtin.negotiation import negotiation_factory
+
+        register_scenario("negotiation", negotiation_factory)
+    elif name == "negotiation_multi":
+        from nest_core.scenarios_builtin.negotiation_multi import (
+            negotiation_multi_factory,
+        )
+
+        register_scenario("negotiation_multi", negotiation_multi_factory)

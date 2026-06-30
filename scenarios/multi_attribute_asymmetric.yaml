@@ -1,0 +1,100 @@
+# SPDX-License-Identifier: Apache-2.0
+# Multi-attribute negotiation -- ASYMMETRIC / cross-brain matchup (Problem-07).
+#
+# WHAT THIS SHOWS:
+# A DIFFERENT negotiation brain per role in a single session -- the multi-attribute
+# ChainAim plugin (`chainaim_neg_multi_pareto`) as the BUYER, and the single-attribute
+# reference plugin (`alternating_offers`) as the SELLER -- via the additive
+# `task.config.role_plugins` block below.
+#
+# VERIFIED RESULT -- one smart agent is enough to recover efficiency:
+# Even though the seller is a price-only brain that ignores the deadline attribute, the
+# ChainAim buyer infers the seller is deadline-heavy and LOGROLLS -- it pins the deadline
+# at the seller's ideal (d=1) and concedes only on price -- so every agreement lands ON
+# the feasible Pareto frontier (pareto_dist=0.000). All four negotiation validators PASS.
+#
+# THE CONTRAST (isolates the strategy from the referee):
+#   * baseline   (stock vs stock) -> FAILs the feasible-frontier check: both ignore
+#                                     deadline, so the deal settles below the frontier.
+#   * asymmetric (smart vs stock) -> PASSes the frontier check: one smart brain recovers
+#                                     efficiency on its own.  <-- THIS scenario.
+#   * market     (smart vs smart) -> PASSes everything.
+# So the per-role `role_plugins` assignment is what makes "exactly one smart agent"
+# expressible, and the frontier validator confirms that one smart agent suffices.
+#   (See packages/nest-core/tests/test_negotiation_asymmetric.py for the lock.)
+#
+# DETERMINISM NOTE: the seller runs vanilla `alternating_offers`, whose open() mints
+# uuid.uuid4() session ids (surfaced as <sid8> on the wire), so this trace is NOT
+# byte-reproducible across runs -- exactly like multi_attribute_baseline. It is therefore
+# locked by VERDICT (seed-deterministic), not byte-golden.
+#
+# Identical to chainaim_multi_attribute_market.yaml EXCEPT the added `role_plugins` block.
+name: multi_attribute_asymmetric
+description: "Cross-brain matchup: ChainAim buyer vs alternating_offers seller (one smart agent reaches the feasible frontier)."
+
+tier: 1
+seed: 42
+
+agents:
+  count: 20
+  brain: state-machine
+  roles:
+    - name: buyer
+      count: 10
+    - name: seller
+      count: 10
+
+layers:
+  transport: in_memory
+  comms: nest_native
+  identity: did_key
+  registry: in_memory
+  auth: jwt
+  trust: score_average
+  payments: prepaid_credits
+  coordination: contract_net
+  # Default-for-all; overridden per role by task.config.role_plugins below.
+  negotiation: chainaim_neg_multi_pareto
+  memory: blackboard
+  privacy: noop
+  datafacts: datafacts_v1
+
+task:
+  type: negotiation_multi
+  config:
+    price_min: 30
+    price_max: 100
+    deadline_min: 1
+    deadline_max: 30
+    buyer_open_price: 30
+    buyer_open_deadline: 30
+    seller_anchor: 95
+    buyer_target: 70
+    seller_target: 60
+    naive_deadline: 15
+    price_step: 5
+    patience: 0.9
+    max_rounds: 12
+    # buyer_w_price / seller_w_price intentionally omitted -> _pair_weights seeds
+    # per-pair weights from `seed` (SC5). Kept identical to the market scenario so
+    # the two differ ONLY in the role_plugins block.
+    #
+    # PER-ROLE STRATEGY ASSIGNMENT (additive, opt-in). Names are resolved by the
+    # factory through PluginRegistry, so any registered negotiation plugin can be
+    # named per role -- not only the layers.negotiation selector above.
+    role_plugins:
+      buyer: chainaim_neg_multi_pareto   # smart: bargains over price AND deadline
+      seller: alternating_offers         # stock: price-only, ignores deadline
+
+failures:
+  message_drop: 0.0
+
+duration: "ticks: 10000"
+
+metrics:
+  - success_rate
+  - mean_latency
+  - message_count
+
+output:
+  trace: ./traces/multi_attribute_asymmetric.jsonl

@@ -412,6 +412,109 @@ class TestAlternatingOffers:
         assert resp.accepted is True
 
 
+class TestChainAimMultiAttributeNegotiation:
+    @pytest.mark.asyncio
+    async def test_open_offer_respond_close(self) -> None:
+        from nest_plugins_reference.negotiation.chainaim_neg_multi_pareto import (
+            ChainAimMultiAttributeNegotiation,
+        )
+
+        neg = ChainAimMultiAttributeNegotiation(
+            AgentId("buyer-0"),
+            weights={"price": 0.7, "deadline": 0.3},
+            bounds={"price": (30, 100), "deadline": (1, 30)},
+            direction={"price": -1, "deadline": 1},
+        )
+        session = await neg.open(AgentId("seller-0"), Terms(price=Money(amount=30)))
+        assert session.status == NegotiationStatus.OPEN
+
+        # Offer at the buyer's worst (dear + short) -> not accepted on the first round.
+        await neg.offer(session, Terms(price=Money(amount=100), conditions={"deadline": 1}))
+        resp = await neg.respond(session)
+        assert isinstance(resp.accepted, bool)
+
+        agreement = await neg.close(session)
+        assert agreement is not None
+        assert agreement.session_id == session.id
+
+    @pytest.mark.asyncio
+    async def test_accepts_offer_at_ideal(self) -> None:
+        from nest_plugins_reference.negotiation.chainaim_neg_multi_pareto import (
+            ChainAimMultiAttributeNegotiation,
+        )
+
+        neg = ChainAimMultiAttributeNegotiation(
+            AgentId("buyer-0"),
+            weights={"price": 0.7, "deadline": 0.3},
+            bounds={"price": (30, 100), "deadline": (1, 30)},
+            direction={"price": -1, "deadline": 1},
+        )
+        session = await neg.open(AgentId("seller-0"), Terms(price=Money(amount=50)))
+        # Buyer ideal: cheapest price + longest deadline -> utility 1.0, clears aspiration.
+        await neg.offer(session, Terms(price=Money(amount=30), conditions={"deadline": 30}))
+        resp = await neg.respond(session)
+        assert resp.accepted is True
+
+    @pytest.mark.asyncio
+    async def test_counter_within_bounds_when_rejecting(self) -> None:
+        from nest_plugins_reference.negotiation.chainaim_neg_multi_pareto import (
+            ChainAimMultiAttributeNegotiation,
+        )
+
+        neg = ChainAimMultiAttributeNegotiation(
+            AgentId("buyer-0"),
+            weights={"price": 0.7, "deadline": 0.3},
+            bounds={"price": (30, 100), "deadline": (1, 30)},
+            direction={"price": -1, "deadline": 1},
+        )
+        session = await neg.open(AgentId("seller-0"), Terms(price=Money(amount=30)))
+        await neg.offer(session, Terms(price=Money(amount=100), conditions={"deadline": 1}))
+        resp = await neg.respond(session)
+        if not resp.accepted:
+            assert resp.counter_terms is not None
+            assert resp.counter_terms.price is not None
+            assert 30 <= int(resp.counter_terms.price.amount) <= 100
+            assert 1 <= int(resp.counter_terms.conditions["deadline"]) <= 30
+
+    @pytest.mark.asyncio
+    async def test_default_construction_is_standalone(self) -> None:
+        from nest_plugins_reference.negotiation.chainaim_neg_multi_pareto import (
+            ChainAimMultiAttributeNegotiation,
+        )
+
+        neg = ChainAimMultiAttributeNegotiation(AgentId("a1"))
+        wp, wd = neg.weights
+        assert abs((wp + wd) - 1.0) < 1e-9
+        session = await neg.open(AgentId("a2"), Terms(price=Money(amount=50)))
+        assert session.status == NegotiationStatus.OPEN
+
+    @pytest.mark.asyncio
+    async def test_no_terms_accepts(self) -> None:
+        from nest_plugins_reference.negotiation.chainaim_neg_multi_pareto import (
+            ChainAimMultiAttributeNegotiation,
+        )
+
+        neg = ChainAimMultiAttributeNegotiation(AgentId("buyer-0"))
+        session = await neg.open(AgentId("seller-0"), Terms())
+        resp = await neg.respond(session)
+        assert resp.accepted is True
+
+    @pytest.mark.asyncio
+    async def test_protocol_surface_matches_alternating_offers(self) -> None:
+        import inspect
+
+        from nest_plugins_reference.negotiation.alternating_offers import AlternatingOffers
+        from nest_plugins_reference.negotiation.chainaim_neg_multi_pareto import (
+            ChainAimMultiAttributeNegotiation,
+        )
+
+        ours_cls = ChainAimMultiAttributeNegotiation
+        for method in ("open", "offer", "respond", "close"):
+            base = list(inspect.signature(getattr(AlternatingOffers, method)).parameters)
+            ours = list(inspect.signature(getattr(ours_cls, method)).parameters)
+            assert ours == base, f"{method} signature drifted from the protocol"
+
+
 # ---------------------------------------------------------------------------
 # 10. Memory: blackboard
 # ---------------------------------------------------------------------------

@@ -7,9 +7,12 @@ import json
 from pathlib import Path
 from typing import Any
 
+from hypothesis import given, settings
+from hypothesis import strategies as st
 from nest_core.validators import (
     VALIDATORS,
     ValidationResult,
+    negotiation_explain,
     validate_auction_all_notified,
     validate_auction_single_winner,
     validate_auction_winner_highest,
@@ -37,6 +40,9 @@ from nest_core.validators import (
     validate_marketplace_no_double_sell,
     validate_marketplace_price_agreement,
     validate_marketplace_responses,
+    validate_negotiation_disclosure,
+    validate_negotiation_frontier,
+    validate_negotiation_pareto,
     validate_reputation_scoring,
     validate_reputation_warnings,
     validate_supply_chain_no_lost,
@@ -1824,9 +1830,328 @@ class TestValidatorRegistry:
             "bft_hotstuff",
             "escrow_marketplace",
             "failure_detection",
+            "negotiation",
         }
         assert set(VALIDATORS.keys()) == expected
 
     def test_each_scenario_has_validators(self) -> None:
         for scenario, validators in VALIDATORS.items():
             assert len(validators) >= 2, f"{scenario} needs at least 2 validators"
+
+
+# ===================================================================
+# Negotiation (multi-attribute Pareto efficiency)
+# ===================================================================
+#
+# Traces are built by hand (as every validator test in this file is) so the CI
+# gate is deterministic and independent of simulator dynamics. Utilities, with
+# bounds price[30,100] / deadline[1,30]:
+#   buyer  (dir price -1, deadline +1): u_price=(100-p)/70, u_deadline=(d-1)/29
+#   seller (dir price +1, deadline -1): u_price=(p-30)/70, u_deadline=(30-d)/29
+# With buyer price-weighted 0.70 and seller deadline-weighted 0.70, the offer
+# (55, 8) strictly dominates the price-only settlement (65, 15) for BOTH parties
+# (buyer cheaper, seller shorter) -- the logrolling gain the validator enforces.
+
+
+def _nego_profile(
+    agent: str,
+    to: str,
+    wp: float,
+    wd: float,
+    *,
+    dir_p: int,
+    dir_d: int,
+    pmin: int = 30,
+    pmax: int = 100,
+    dmin: int = 1,
+    dmax: int = 30,
+) -> Event:
+    body = (
+        f"nego:profile:sess0:{agent}:wp{wp:.2f}:wd{wd:.2f}:"
+        f"pmin{pmin}:pmax{pmax}:dmin{dmin}:dmax{dmax}:dir_p{dir_p:+d}:dir_d{dir_d:+d}"
+    )
+    return _send(agent, to, body)
+
+
+def _nego_offer(agent: str, to: str, kind: str, rnd: int, price: int, deadline: int) -> Event:
+    return _send(agent, to, f"nego:{kind}:sess0:r{rnd}:p{price}:d{deadline}")
+
+
+class TestNegotiationPareto:
+    def _profiles(self) -> list[Event]:
+        return [
+            _nego_profile("buyer-0", "seller-0", 0.70, 0.30, dir_p=-1, dir_d=1),
+            _nego_profile("seller-0", "buyer-0", 0.30, 0.70, dir_p=1, dir_d=-1),
+        ]
+
+    def test_dominated_agreement_is_flagged(self) -> None:
+        # Exercises the exchanged-offers validator's dominance LOGIC: the trace
+        # deliberately puts a logrolling offer (p55/d8) on the wire that dominates
+        # the p65/d15 settlement. A *real* symmetric bilateral alternating_offers run
+        # never emits such a point -- its exchanged offers form a Pareto antichain
+        # (along any fixed deadline, price is a pure transfer), so the exchanged-offers
+        # check would PASS it. Catching the dominated baseline settlement is the job of
+        # validate_negotiation_frontier (feasible frontier), see TestNegotiationFrontier.
+        events = [
+            *self._profiles(),
+            _nego_offer("buyer-0", "seller-0", "offer", 0, 30, 30),
+            _nego_offer("seller-0", "buyer-0", "counter", 1, 90, 1),
+            _nego_offer("buyer-0", "seller-0", "counter", 2, 55, 8),
+            _nego_offer("seller-0", "buyer-0", "counter", 3, 65, 15),
+            _nego_offer("buyer-0", "seller-0", "accept", 4, 65, 15),
+        ]
+        results = validate_negotiation_pareto(events)
+        assert len(results) == 1
+        assert results[0].passed is False
+        assert "dominated" in results[0].detail
+
+    def test_chainaim_trace_is_pareto_optimal(self) -> None:
+        events = [
+            *self._profiles(),
+            _nego_offer("buyer-0", "seller-0", "offer", 0, 30, 30),
+            _nego_offer("seller-0", "buyer-0", "counter", 1, 90, 1),
+            _nego_offer("buyer-0", "seller-0", "counter", 2, 50, 10),
+            _nego_offer("seller-0", "buyer-0", "counter", 3, 60, 6),
+            _nego_offer("buyer-0", "seller-0", "accept", 4, 55, 8),
+        ]
+        results = validate_negotiation_pareto(events)
+        assert len(results) == 1
+        assert results[0].passed is True
+
+    def test_breakdown_is_not_failure(self) -> None:
+        events = [
+            *self._profiles(),
+            _nego_offer("buyer-0", "seller-0", "offer", 0, 30, 30),
+            _nego_offer("seller-0", "buyer-0", "counter", 1, 90, 1),
+        ]
+        results = validate_negotiation_pareto(events)
+        assert results[0].passed is True
+        assert "breakdown" in results[0].detail
+
+    def test_missing_profile_is_skipped_not_failed(self) -> None:
+        events = [
+            _nego_offer("buyer-0", "seller-0", "offer", 0, 30, 30),
+            _nego_offer("buyer-0", "seller-0", "accept", 1, 65, 15),
+        ]
+        results = validate_negotiation_pareto(events)
+        assert results[0].passed is True
+
+    def test_signature_suffix_is_stripped(self) -> None:
+        events = [
+            *self._profiles(),
+            _send("buyer-0", "seller-0", "nego:offer:sess0:r0:p30:d30|sig:abc"),
+            _send("buyer-0", "seller-0", "nego:counter:sess0:r2:p55:d8|sig:def"),
+            _send("buyer-0", "seller-0", "nego:accept:sess0:r4:p65:d15|sig:xyz"),
+        ]
+        results = validate_negotiation_pareto(events)
+        assert results[0].passed is False
+
+    def test_routes_through_validate_events(self) -> None:
+        # Registry wires FOUR negotiation validators (pareto, disclosure, frontier,
+        # individual_rationality). Agreement is the feasible optimum p30/d1, so all
+        # four PASS -- IR no-ops PASS because these 12-field profiles disclose no rmin.
+        events = [
+            *self._profiles(),
+            _nego_offer("buyer-0", "seller-0", "offer", 0, 30, 30),
+            _nego_offer("buyer-0", "seller-0", "accept", 1, 30, 1),
+        ]
+        results = validate_events(events, "negotiation")
+        assert len(results) == 4
+        assert all(r.passed for r in results)
+
+    def test_explain_reports_weights_and_frontier(self) -> None:
+        events = [
+            *self._profiles(),
+            _nego_offer("buyer-0", "seller-0", "offer", 0, 30, 30),
+            _nego_offer("seller-0", "buyer-0", "counter", 1, 90, 1),
+            _nego_offer("buyer-0", "seller-0", "accept", 2, 55, 8),
+        ]
+        text = negotiation_explain(events)
+        assert "buyer-0" in text
+        assert "frontier" in text
+
+
+class TestNegotiationDisclosure:
+    def test_pass_all_disclosed(self) -> None:
+        events = [
+            _nego_profile("buyer-0", "seller-0", 0.70, 0.30, dir_p=-1, dir_d=1),
+            _nego_profile("seller-0", "buyer-0", 0.30, 0.70, dir_p=1, dir_d=-1),
+            _nego_offer("buyer-0", "seller-0", "offer", 0, 30, 30),
+            _nego_offer("seller-0", "buyer-0", "counter", 1, 90, 1),
+        ]
+        results = validate_negotiation_disclosure(events)
+        assert results[0].passed is True
+
+    def test_fail_undisclosed_bargainer(self) -> None:
+        events = [
+            _nego_profile("buyer-0", "seller-0", 0.70, 0.30, dir_p=-1, dir_d=1),
+            _nego_offer("buyer-0", "seller-0", "offer", 0, 30, 30),
+            _nego_offer("seller-0", "buyer-0", "counter", 1, 90, 1),
+        ]
+        results = validate_negotiation_disclosure(events)
+        assert results[0].passed is False
+        assert "seller-0" in results[0].detail
+
+
+class TestNegotiationFrontier:
+    """Feasible-frontier check: catches dominated agreements the exchanged-offers
+    check structurally cannot (a price-only run only trades a Pareto antichain).
+    Traces are hand-built so the gate is deterministic."""
+
+    def _profiles(self) -> list[Event]:
+        return [
+            _nego_profile("buyer-0", "seller-0", 0.70, 0.30, dir_p=-1, dir_d=1),
+            _nego_profile("seller-0", "buyer-0", 0.30, 0.70, dir_p=1, dir_d=-1),
+        ]
+
+    def test_dominated_baseline_settlement_is_flagged(self) -> None:
+        # Price-only baseline settles p50/d15 (deadline pinned mid-range). The
+        # feasible point p30/d1 = U(0.700, 0.700) strictly dominates it for BOTH
+        # parties yet is never exchanged in a bilateral price-only run -- only the
+        # feasible-frontier check can catch it.
+        events = [
+            *self._profiles(),
+            _nego_offer("buyer-0", "seller-0", "offer", 0, 30, 30),
+            _nego_offer("seller-0", "buyer-0", "counter", 1, 90, 1),
+            _nego_offer("buyer-0", "seller-0", "counter", 2, 50, 15),
+            _nego_offer("seller-0", "buyer-0", "accept", 3, 50, 15),
+        ]
+        results = validate_negotiation_frontier(events)
+        assert len(results) == 1
+        assert results[0].passed is False
+        assert "feasible" in results[0].detail
+
+    def test_frontier_optimal_agreement_passes(self) -> None:
+        # Market-shaped: chainaim settles on the feasible optimum p30/d1, where each
+        # party maxes its higher-weighted attribute -- nothing feasible dominates it.
+        events = [
+            *self._profiles(),
+            _nego_offer("buyer-0", "seller-0", "offer", 0, 30, 30),
+            _nego_offer("seller-0", "buyer-0", "counter", 1, 60, 1),
+            _nego_offer("buyer-0", "seller-0", "accept", 2, 30, 1),
+        ]
+        results = validate_negotiation_frontier(events)
+        assert results[0].passed is True
+        assert "frontier" in results[0].detail
+
+    def test_breakdown_is_not_failure(self) -> None:
+        events = [
+            *self._profiles(),
+            _nego_offer("buyer-0", "seller-0", "offer", 0, 30, 30),
+            _nego_offer("seller-0", "buyer-0", "counter", 1, 90, 1),
+        ]
+        results = validate_negotiation_frontier(events)
+        assert results[0].passed is True
+        assert "breakdown" in results[0].detail
+
+    def test_missing_profile_is_skipped_not_failed(self) -> None:
+        events = [
+            _nego_offer("buyer-0", "seller-0", "offer", 0, 30, 30),
+            _nego_offer("buyer-0", "seller-0", "accept", 1, 50, 15),
+        ]
+        results = validate_negotiation_frontier(events)
+        assert results[0].passed is True
+
+    def test_eps_flag_relaxes_strict_dominance(self) -> None:
+        # The dominated p50/d15 settlement FAILs under the default (strict) eps.
+        # Widening eps suppresses the flag. eps must exceed the LARGEST feasible
+        # dominance margin, not just p30/d1's: e.g. feasible p42/d1 already gives the
+        # seller a ~0.30 gain, so a partial value like 0.30 is NOT enough. At eps=1.0
+        # no feasible point can beat the agreement by more than eps on any party
+        # (utilities are bounded by 1.0), so strict dominance is impossible and the
+        # check PASSes -- proving the tolerance flag is wired.
+        events = [
+            *self._profiles(),
+            _nego_offer("buyer-0", "seller-0", "offer", 0, 30, 30),
+            _nego_offer("buyer-0", "seller-0", "accept", 1, 50, 15),
+        ]
+        assert validate_negotiation_frontier(events)[0].passed is False
+        assert validate_negotiation_frontier(events, eps=1.0)[0].passed is True
+
+    def test_grid_step_flag_is_accepted(self) -> None:
+        # A coarser grid still includes the lo-corner dominator p30/d1, so the
+        # canonical dominated settlement is still flagged; exercises the flag.
+        events = [
+            *self._profiles(),
+            _nego_offer("buyer-0", "seller-0", "offer", 0, 30, 30),
+            _nego_offer("buyer-0", "seller-0", "accept", 1, 50, 15),
+        ]
+        results = validate_negotiation_frontier(events, grid_step=5)
+        assert results[0].passed is False
+
+
+class TestNegotiationFrontierProperty:
+    @settings(max_examples=30, deadline=None)
+    @given(
+        wp_b=st.integers(min_value=10, max_value=90),
+        wp_s=st.integers(min_value=10, max_value=90),
+    )
+    def test_utilitarian_max_point_is_never_flagged(self, wp_b: int, wp_s: int) -> None:
+        """The feasible point maximising the (positively weighted) utility SUM is
+        Pareto-optimal, so an agreement there is never flagged by the frontier check."""
+        wpb = round(wp_b / 100, 2)
+        wps = round(wp_s / 100, 2)
+        wdb = round(1.0 - wpb, 2)
+        wds = round(1.0 - wps, 2)
+
+        def u_buyer(p: int, d: int) -> float:
+            return wpb * ((100 - p) / 70) + wdb * ((d - 1) / 29)
+
+        def u_seller(p: int, d: int) -> float:
+            return wps * ((p - 30) / 70) + wds * ((30 - d) / 29)
+
+        best = max(
+            ((p, d) for p in range(30, 101) for d in range(1, 31)),
+            key=lambda pd: u_buyer(*pd) + u_seller(*pd),
+        )
+        events: list[Event] = [
+            _nego_profile("buyer-0", "seller-0", wpb, wdb, dir_p=-1, dir_d=1),
+            _nego_profile("seller-0", "buyer-0", wps, wds, dir_p=1, dir_d=-1),
+            _nego_offer("buyer-0", "seller-0", "offer", 0, best[0], best[1]),
+            _nego_offer("buyer-0", "seller-0", "accept", 1, best[0], best[1]),
+        ]
+        results = validate_negotiation_frontier(events)
+        assert results[0].passed is True
+
+
+class TestNegotiationParetoProperty:
+    @settings(max_examples=50, deadline=None)
+    @given(
+        wp_b=st.integers(min_value=10, max_value=90),
+        wp_s=st.integers(min_value=10, max_value=90),
+        offers=st.lists(
+            st.tuples(
+                st.integers(min_value=30, max_value=100),
+                st.integers(min_value=1, max_value=30),
+            ),
+            min_size=1,
+            max_size=8,
+        ),
+    )
+    def test_utilitarian_max_offer_is_never_dominated(
+        self, wp_b: int, wp_s: int, offers: list[tuple[int, int]]
+    ) -> None:
+        """The exchanged offer maximising the positively weighted utility SUM is a
+        Pareto-optimal point, so the validator never reports it dominated."""
+        wpb = round(wp_b / 100, 2)
+        wps = round(wp_s / 100, 2)
+        wdb = round(1.0 - wpb, 2)
+        wds = round(1.0 - wps, 2)
+        profiles = [
+            _nego_profile("buyer-0", "seller-0", wpb, wdb, dir_p=-1, dir_d=1),
+            _nego_profile("seller-0", "buyer-0", wps, wds, dir_p=1, dir_d=-1),
+        ]
+
+        def u_buyer(p: int, d: int) -> float:
+            return wpb * ((100 - p) / 70) + wdb * ((d - 1) / 29)
+
+        def u_seller(p: int, d: int) -> float:
+            return wps * ((p - 30) / 70) + wds * ((30 - d) / 29)
+
+        best = max(offers, key=lambda pd: u_buyer(*pd) + u_seller(*pd))
+        events: list[Event] = list(profiles)
+        for i, (p, d) in enumerate(offers):
+            events.append(_nego_offer("buyer-0", "seller-0", "offer", i, p, d))
+        events.append(_nego_offer("buyer-0", "seller-0", "accept", len(offers), best[0], best[1]))
+        results = validate_negotiation_pareto(events)
+        assert results[0].passed is True

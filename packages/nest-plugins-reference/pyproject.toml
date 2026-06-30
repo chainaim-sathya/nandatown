@@ -46,6 +46,12 @@ cid_facts = "nest_plugins_reference.datafacts.cid_facts:CidFacts"
 heartbeat = "nest_plugins_reference.failure_detection.heartbeat:HeartbeatFailureDetector"
 phi_accrual = "nest_plugins_reference.failure_detection.phi_accrual:PhiAccrualFailureDetector"
 
+# ChainAim Problem-07 multi-attribute negotiation plugin. Discovered by the
+# plugin registry via the `nest.plugins.negotiation` entry-point group, so it
+# registers without touching `nest_core.plugins` (the sanctioned external path).
+[project.entry-points."nest.plugins.negotiation"]
+chainaim_neg_multi_pareto = "nest_plugins_reference.negotiation.chainaim_neg_multi_pareto:ChainAimMultiAttributeNegotiation"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

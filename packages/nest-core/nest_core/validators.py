@@ -18,9 +18,11 @@ Example::
 from __future__ import annotations
 
 import contextlib
+import itertools
 import json
+import math
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, cast
 
@@ -3727,6 +3729,1016 @@ def validate_bft_no_stuck_view(
     ]
 
 
+# Negotiation validators (multi-attribute Pareto efficiency)
+# ---------------------------------------------------------------------------
+#
+# Canonical utility formula -- design grounding D.2. The per-attribute
+# primitives ``_ideal_worst`` and ``_u_attr`` are DUPLICATED BYTE-FOR-BYTE from
+# ``nest_plugins_reference.negotiation.chainaim_neg_multi_pareto``; the validator
+# cannot import the plugin (layer separation), so the two copies MUST stay
+# identical. ``_party_utility`` is the N-attribute generic form of the plugin's
+# ``_utility`` (``U = sum(weight_attr * u_attr(value_attr))``), kept generic so the
+# dominance check is not hard-coded to two attributes.
+
+_NEG_EPS = 1e-9
+
+
+def _ideal_worst(lo: int, hi: int, direction: int) -> tuple[int, int]:
+    """Return ``(ideal, worst)`` for an attribute over ``[lo, hi]`` given direction.
+
+    ``direction >= 0`` means higher is better (``ideal=hi``); otherwise lower is
+    better (``ideal=lo``).
+
+    Example::
+
+        ideal, worst = _ideal_worst(30, 100, -1)  # (30, 100): cheap is ideal
+    """
+    if direction >= 0:
+        return hi, lo
+    return lo, hi
+
+
+def _u_attr(value: float, ideal: int, worst: int) -> float:
+    """Single-attribute utility in ``[0, 1]`` (higher is better).
+
+    Computes ``clamp((value - worst) / (ideal - worst), 0.0, 1.0)``.
+
+    Example::
+
+        u = _u_attr(30.0, 30, 100)  # 1.0
+    """
+    span = ideal - worst
+    if span == 0:
+        return 0.0
+    u = (value - worst) / span
+    if u < 0.0:
+        return 0.0
+    if u > 1.0:
+        return 1.0
+    return u
+
+
+class _NegProfile:
+    """A negotiator's disclosed private profile, parsed from a ``nego:profile`` token.
+
+    The token is **version-tolerant**: the canonical 12-field form carries weights,
+    bounds, and directions; an optional 13th ``rmin<u>`` field discloses the agent's
+    individual-rationality reservation -- a utility floor in ``[0, 1]``. When absent,
+    ``reservation`` is ``None`` and IR checks no-op for this agent, so the required
+    12-field ``chainaim_multi_attribute_market.yaml`` token is unaffected.
+
+    Example::
+
+        prof = _NegProfile.parse(
+            "nego:profile:buyer-0x:buyer-0:wp0.70:wd0.30:"
+            "pmin30:pmax100:dmin1:dmax30:dir_p-1:dir_d+1"
+        )  # 12-field -> reservation is None
+    """
+
+    def __init__(
+        self,
+        agent: str,
+        weights: dict[str, float],
+        bounds: dict[str, tuple[int, int]],
+        direction: dict[str, int],
+        reservation: float | None = None,
+    ) -> None:
+        self.agent = agent
+        self.weights = weights
+        self.bounds = bounds
+        self.direction = direction
+        self.reservation = reservation
+
+    @classmethod
+    def parse(cls, body: str) -> _NegProfile | None:
+        """Parse a profile token body; return ``None`` if it is not a profile token.
+
+        Accepts the canonical **12-field** token and the **13-field** variant with a
+        trailing ``rmin<u>`` reservation. A 13th field that is not an ``rmin`` token is
+        treated as malformed and rejected (``None``), never silently mis-parsed.
+
+        Example::
+
+            prof = _NegProfile.parse(body)
+        """
+        parts = body.split(":")
+        if len(parts) not in (12, 13) or parts[0] != "nego" or parts[1] != "profile":
+            return None
+        agent = parts[3]
+        try:
+            wp = float(parts[4][2:])
+            wd = float(parts[5][2:])
+            pmin = int(parts[6][4:])
+            pmax = int(parts[7][4:])
+            dmin = int(parts[8][4:])
+            dmax = int(parts[9][4:])
+            dir_p = int(parts[10][5:])
+            dir_d = int(parts[11][5:])
+            reservation: float | None = None
+            if len(parts) == 13:
+                if not parts[12].startswith("rmin"):
+                    return None
+                reservation = float(parts[12][4:])
+        except (ValueError, IndexError):
+            return None
+        return cls(
+            agent,
+            {"price": wp, "deadline": wd},
+            {"price": (pmin, pmax), "deadline": (dmin, dmax)},
+            {"price": dir_p, "deadline": dir_d},
+            reservation,
+        )
+
+    @classmethod
+    def parse_n(
+        cls,
+        body: str,
+        attrs: tuple[str, ...] = ("price", "deadline"),
+        field_keys: dict[str, tuple[str, str, str, str]] | None = None,
+    ) -> _NegProfile | None:
+        """N-attribute profile parser; the generalisation of :meth:`parse` (iter 4).
+
+        Parses ``nego:profile:<sid8>:<agent>`` followed, in ``attrs`` order, by one
+        weight token per attribute, then a ``min``/``max`` bound-token pair per
+        attribute, then a direction token per attribute, with an optional trailing
+        ``rmin<u>`` reservation. ``field_keys`` maps each attribute to its
+        ``(weight, min, max, dir)`` token prefixes; the defaults reproduce the
+        canonical price/deadline field names. For ``attrs == ("price", "deadline")``
+        this parses exactly the tokens :meth:`parse` parses and yields an identical
+        profile -- :meth:`parse` is kept as the verbatim fast-path for the required
+        scenarios, so the two are equivalent on the 12/13-field form by construction.
+        Mirrors ``_encode_profile_n`` in the negotiation scenario driver.
+
+        Example::
+
+            prof = _NegProfile.parse_n(body)
+        """
+        keys = (
+            {"price": ("wp", "pmin", "pmax", "dir_p"), "deadline": ("wd", "dmin", "dmax", "dir_d")}
+            if field_keys is None
+            else dict(field_keys)
+        )
+        parts = body.split(":")
+        n = len(attrs)
+        base = 4 + n + 2 * n + n  # head(4) + weights(n) + bounds(2n) + directions(n)
+        if len(parts) not in (base, base + 1) or parts[0] != "nego" or parts[1] != "profile":
+            return None
+        agent = parts[3]
+        weights: dict[str, float] = {}
+        bounds: dict[str, tuple[int, int]] = {}
+        direction: dict[str, int] = {}
+        try:
+            wbase = 4
+            bbase = wbase + n
+            dbase = bbase + 2 * n
+            for i, a in enumerate(attrs):
+                wkey, minkey, maxkey, dirkey = keys[a]
+                weights[a] = float(parts[wbase + i][len(wkey) :])
+                lo = int(parts[bbase + 2 * i][len(minkey) :])
+                hi = int(parts[bbase + 2 * i + 1][len(maxkey) :])
+                bounds[a] = (lo, hi)
+                direction[a] = int(parts[dbase + i][len(dirkey) :])
+            reservation: float | None = None
+            if len(parts) == base + 1:
+                if not parts[base].startswith("rmin"):
+                    return None
+                reservation = float(parts[base][4:])
+        except (ValueError, IndexError):
+            return None
+        return cls(agent, weights, bounds, direction, reservation)
+
+
+def _party_utility(values: dict[str, float], profile: _NegProfile) -> float:
+    """Weighted multi-attribute utility for ``profile`` over disclosed attributes.
+
+    Implements grounding D.2 ``U = sum(weight_attr * u_attr(value_attr))`` generically
+    over every attribute the agent disclosed, using the byte-identical ``_u_attr``
+    and ``_ideal_worst`` primitives.
+
+    Example::
+
+        u = _party_utility({"price": 30, "deadline": 1}, profile)
+    """
+    total = 0.0
+    for attr, weight in profile.weights.items():
+        lo, hi = profile.bounds[attr]
+        ideal, worst = _ideal_worst(lo, hi, profile.direction[attr])
+        total += weight * _u_attr(values[attr], ideal, worst)
+    return total
+
+
+def _parse_neg_offer_n(
+    body: str,
+    attrs: tuple[str, ...] = ("price", "deadline"),
+    prefix: dict[str, str] | None = None,
+) -> tuple[str, str, int, dict[str, int]] | None:
+    """N-attribute offer parser; return ``(kind, sid8, round, values)`` or ``None``.
+
+    Generalises :func:`_parse_neg_offer` to a variable-length attribute list (iter 4).
+    Expects ``nego:<kind>:<sid8>:r<round>`` followed by exactly ``len(attrs)`` value
+    tokens in order, each optionally carrying its single-letter ``prefix``. Profile and
+    malformed tokens return ``None``. For ``attrs == ("price", "deadline")`` it accepts
+    exactly the 6-part tokens the legacy parser accepted, so the verdict path is
+    unchanged. Mirrors ``_decode_n`` in the negotiation scenario driver.
+
+    Example::
+
+        kind, sid8, rnd, vals = _parse_neg_offer_n("nego:offer:ab:r0:p30:d1")
+    """
+    pref = {"price": "p", "deadline": "d"} if prefix is None else dict(prefix)
+    parts = body.split(":")
+    if len(parts) != 4 + len(attrs) or parts[0] != "nego" or parts[1] == "profile":
+        return None
+    kind, sid8, r_tok = parts[1], parts[2], parts[3]
+    try:
+        rnd = int(r_tok[1:]) if r_tok.startswith("r") else int(r_tok)
+        values: dict[str, int] = {}
+        for i, a in enumerate(attrs):
+            tok = parts[4 + i]
+            p = pref[a]
+            values[a] = int(tok[len(p) :]) if tok.startswith(p) else int(tok)
+    except (ValueError, IndexError):
+        return None
+    return kind, sid8, rnd, values
+
+
+def _neg_attr_schema(
+    events: list[dict[str, Any]],
+) -> tuple[tuple[str, ...], dict[str, tuple[str, str, str, str]], dict[str, str]]:
+    """Infer the negotiation attribute schema from the trace's profile tokens.
+
+    Returns ``(attrs, field_keys, prefix)`` for the generalised parsers. When every
+    disclosed profile carries the canonical two attributes (<=12/13 fields) the schema
+    is the legacy ``("price", "deadline")`` form, so the verdict path is byte-identical
+    to the pre-N collector (``parse_n`` with these defaults is offset-identical to
+    ``parse``). When any profile discloses >2 attributes, the extra attributes are
+    recovered from the weight-token suffixes by the wire convention ``w<x>`` /
+    ``<x>min`` / ``<x>max`` / ``dir_<x>`` with offer-prefix ``<x>`` (e.g. a ``wq``
+    weight token -> attribute key ``"q"`` with offer prefix ``"q"``). Homogeneous N
+    across one trace is assumed -- the scenario configures one attribute list.
+
+    Example::
+
+        attrs, field_keys, prefix = _neg_attr_schema(events)
+    """
+    max_n = 2
+    rep_parts: list[str] | None = None
+    for ev in events:
+        if ev.get("kind") != "send":
+            continue
+        body = _message_body(ev)
+        if not body.startswith("nego:profile:"):
+            continue
+        parts = body.split(":")
+        n = (len(parts) - 4) // 4  # head(4) + weights(n)+bounds(2n)+dirs(n); rmin ignored
+        if n > max_n:
+            max_n = n
+            rep_parts = parts
+    if max_n <= 2 or rep_parts is None:
+        return (
+            ("price", "deadline"),
+            {
+                "price": ("wp", "pmin", "pmax", "dir_p"),
+                "deadline": ("wd", "dmin", "dmax", "dir_d"),
+            },
+            {"price": "p", "deadline": "d"},
+        )
+    attrs = tuple(rep_parts[4 + i][1] for i in range(max_n))
+    field_keys = {a: (f"w{a}", f"{a}min", f"{a}max", f"dir_{a}") for a in attrs}
+    prefix = {a: a for a in attrs}
+    return attrs, field_keys, prefix
+
+
+def _fmt_point(vals: dict[str, float]) -> str:
+    """Render an attribute value-dict as the legacy ``p<price>/d<deadline>`` detail token.
+
+    Uses each attribute key's first character as the short label, so the two-attribute
+    case yields exactly ``p<price>/d<deadline>`` (byte-identical detail strings) and an
+    N-attribute case extends it (e.g. ``p30/d1/q9``).
+
+    Example::
+
+        _fmt_point({"price": 30, "deadline": 1})  # "p30/d1"
+    """
+    return "/".join(f"{a[0]}{int(v)}" for a, v in vals.items())
+
+
+def _collect_negotiation(
+    events: list[dict[str, Any]],
+) -> tuple[
+    dict[str, _NegProfile],
+    dict[tuple[str, str], list[tuple[str, dict[str, float]]]],
+    dict[tuple[str, str], dict[str, float]],
+]:
+    """Parse profiles, exchanged offers, and agreements from a trace.
+
+    Sessions are keyed by the sorted ``(agent_a, agent_b)`` pair, because each
+    party opens its own session id, so the two halves of one negotiation carry
+    different session ids but the same participant pair.
+
+    Example::
+
+        profiles, offers, agreements = _collect_negotiation(events)
+    """
+    attrs, field_keys, prefix = _neg_attr_schema(events)
+    profiles: dict[str, _NegProfile] = {}
+    offers: dict[tuple[str, str], list[tuple[str, dict[str, float]]]] = defaultdict(list)
+    agreements: dict[tuple[str, str], dict[str, float]] = {}
+
+    for ev in events:
+        if ev.get("kind") != "send":
+            continue
+        body = _message_body(ev)
+        if not body.startswith("nego:"):
+            continue
+        sender = str(ev.get("agent", ""))
+        recipient = str(ev.get("to", ""))
+
+        prof = _NegProfile.parse_n(body, attrs, field_keys)
+        if prof is not None:
+            profiles.setdefault(prof.agent or sender, prof)
+            continue
+
+        parsed = _parse_neg_offer_n(body, attrs, prefix)
+        if parsed is None:
+            continue
+        kind, _sid8, _rnd, raw = parsed
+        vals = {a: float(raw[a]) for a in attrs}
+        pair = (sender, recipient) if sender <= recipient else (recipient, sender)
+        if kind in ("offer", "counter"):
+            offers[pair].append((sender, vals))
+        elif kind == "accept":
+            agreements[pair] = vals
+            offers[pair].append((sender, vals))
+        # ``close`` echoes the agreed terms; not needed for dominance.
+
+    return profiles, offers, agreements
+
+
+def validate_negotiation_pareto(
+    events: list[dict[str, Any]],
+) -> list[ValidationResult]:
+    """No agreement is Pareto-dominated by an offer exchanged during its session.
+
+    Each agent discloses its private weighted multi-attribute utility once via a
+    ``nego:profile`` token; offers, counters, and accepts are recorded per
+    negotiating pair. For every pair that reached agreement, the agreement must not
+    be strictly dominated by any exchanged offer (some party strictly better off,
+    none worse) -- the price-only baseline weakness this check exposes. A breakdown
+    (no agreement) is not a failure. The dominance test loops over every disclosed
+    attribute, so it is not hard-coded to the price/deadline pair.
+
+    **Why this legitimately PASSES the symmetric price-only baseline.** When a
+    baseline bargains on price alone at a fixed deadline, every exchanged offer is a
+    pure transfer (one party's gain is the other's loss), so the spoken bids form a
+    Pareto **antichain** -- no exchanged offer dominates another, and this
+    observed-bids check correctly reports PASS. The dominating *logrolling* deal was
+    never put on the wire; it is caught instead by
+    :func:`validate_negotiation_frontier`, which reconstructs the feasible outcome
+    space. This is by design, not a gap.
+
+    Example::
+
+        results = validate_negotiation_pareto(events)
+    """
+    profiles, offers, agreements = _collect_negotiation(events)
+
+    violations: list[str] = []
+    skipped: list[str] = []
+    agreed = 0
+    breakdowns = 0
+
+    for pair, offer_list in offers.items():
+        a, b = pair
+        if pair not in agreements:
+            breakdowns += 1
+            continue
+        pa = profiles.get(a)
+        pb = profiles.get(b)
+        if pa is None or pb is None:
+            skipped.append(f"{a}<->{b} (missing profile)")
+            continue
+        agreed += 1
+        agree_vals = agreements[pair]
+        ua_agree = _party_utility(agree_vals, pa)
+        ub_agree = _party_utility(agree_vals, pb)
+
+        for _origin, ovals in offer_list:
+            ua_off = _party_utility(ovals, pa)
+            ub_off = _party_utility(ovals, pb)
+            weakly = ua_off >= ua_agree - _NEG_EPS and ub_off >= ub_agree - _NEG_EPS
+            strictly = ua_off > ua_agree + _NEG_EPS or ub_off > ub_agree + _NEG_EPS
+            if weakly and strictly:
+                violations.append(
+                    f"{a}<->{b}: agreed {_fmt_point(agree_vals)} "
+                    f"(U={ua_agree:.3f},{ub_agree:.3f}) dominated by exchanged "
+                    f"{_fmt_point(ovals)} (U={ua_off:.3f},{ub_off:.3f})"
+                )
+                break
+
+    if violations:
+        detail = "; ".join(violations)
+        if skipped:
+            detail += f" | skipped: {', '.join(skipped)}"
+        return [ValidationResult("negotiation_pareto_efficient", False, detail)]
+
+    detail = f"{agreed} agreement(s) Pareto-efficient, {breakdowns} breakdown(s)"
+    if skipped:
+        detail += f", {len(skipped)} skipped (missing profile)"
+    return [ValidationResult("negotiation_pareto_efficient", True, detail)]
+
+
+def _feasible_points(
+    pa: _NegProfile,
+    pb: _NegProfile,
+    *,
+    grid_step: int = 1,
+) -> Iterator[tuple[dict[str, int], float, float]]:
+    """Yield every feasible grid point with both parties' utilities.
+
+    The feasible region is the per-attribute *intersection* of the two parties'
+    disclosed bound boxes, swept at integer resolution ``grid_step`` via
+    :func:`itertools.product`, generic over whatever attributes both disclosed.
+    This is the single shared sweep used by both :func:`_frontier_dominator`
+    (dominance versus a reached agreement) and :func:`_zopa_point` (clearing both
+    disclosed reservations), so the two can never drift on which points they
+    consider. Points are yielded in ``itertools.product`` order; a caller that only
+    needs the first match should ``break`` to keep the original short-circuit.
+
+    Example::
+
+        for point, ua, ub in _feasible_points(buyer, seller):
+            ...
+    """
+    step = max(1, int(grid_step))
+    attrs = [a for a in pa.weights if a in pb.weights]
+    axis_values: list[list[int]] = []
+    for attr in attrs:
+        alo, ahi = pa.bounds[attr]
+        blo, bhi = pb.bounds[attr]
+        lo, hi = max(alo, blo), min(ahi, bhi)
+        axis_values.append(list(range(lo, hi + 1, step)))
+
+    for combo in itertools.product(*axis_values):
+        vals = {attr: float(v) for attr, v in zip(attrs, combo, strict=True)}
+        ua = _party_utility(vals, pa)
+        ub = _party_utility(vals, pb)
+        point = {attr: int(v) for attr, v in zip(attrs, combo, strict=True)}
+        yield point, ua, ub
+
+
+def _frontier_dominator(
+    pa: _NegProfile,
+    pb: _NegProfile,
+    ua_agree: float,
+    ub_agree: float,
+    *,
+    grid_step: int = 1,
+    eps: float = _NEG_EPS,
+) -> tuple[dict[str, int], float, float] | None:
+    """Return the first feasible grid point that strictly dominates the agreement.
+
+    A point dominates when both parties are no worse than the agreement (within
+    ``eps``) and at least one is better by more than ``eps``. Returns
+    ``(point, ua, ub)`` or ``None`` when the agreement is already on the feasible
+    Pareto frontier. Delegates the feasible sweep to :func:`_feasible_points` and
+    short-circuits on the first dominator, so behaviour is identical to the prior
+    inline sweep.
+
+    Example::
+
+        dom = _frontier_dominator(buyer, seller, 0.645, 0.448)
+    """
+    for point, ua, ub in _feasible_points(pa, pb, grid_step=grid_step):
+        weakly = ua >= ua_agree - eps and ub >= ub_agree - eps
+        strictly = ua > ua_agree + eps or ub > ub_agree + eps
+        if weakly and strictly:
+            return point, ua, ub
+    return None
+
+
+def _zopa_point(
+    pa: _NegProfile,
+    pb: _NegProfile,
+    res_a: float,
+    res_b: float,
+    *,
+    grid_step: int = 1,
+    eps: float = _NEG_EPS,
+    require_surplus: bool = False,
+) -> tuple[dict[str, int], float, float] | None:
+    """Return the first feasible point that clears BOTH disclosed reservations.
+
+    A breakdown is *unjustified* when a deal both parties would rationally have
+    accepted existed -- some feasible grid point gives each party at least its
+    walk-away reservation (its BATNA floor). With ``require_surplus=False``
+    (default, faithful to grounding D.2) "clears" is the weak ``>=`` test: a point
+    on or above both floors within ``eps``. With ``require_surplus=True`` each party
+    must strictly exceed its floor by more than ``eps`` (a genuine bilateral
+    surplus), which ignores ties exactly on the reservation line. Returns
+    ``(point, ua, ub)`` for the first clearing point, or ``None`` when no feasible
+    point clears both floors -- a legitimate breakdown with no zone of possible
+    agreement. Shares :func:`_feasible_points` with :func:`_frontier_dominator`.
+
+    Example::
+
+        pt = _zopa_point(buyer, seller, 0.30, 0.30)
+    """
+    for point, ua, ub in _feasible_points(pa, pb, grid_step=grid_step):
+        if require_surplus:
+            clears = ua > res_a + eps and ub > res_b + eps
+        else:
+            clears = ua >= res_a - eps and ub >= res_b - eps
+        if clears:
+            return point, ua, ub
+    return None
+
+
+def validate_negotiation_frontier(
+    events: list[dict[str, Any]],
+    *,
+    grid_step: int = 1,
+    eps: float = _NEG_EPS,
+) -> list[ValidationResult]:
+    """No agreement is dominated by a *feasible* point on the disclosed frontier.
+
+    Where :func:`validate_negotiation_pareto` inspects only the offers actually put
+    on the wire, this check reconstructs the **feasible** outcome space from the two
+    disclosed ``nego:profile`` tokens and sweeps the full integer ``price x
+    deadline`` grid. An agreement FAILs if some feasible grid point makes one party
+    better off (by more than ``eps``) without making the other worse -- i.e. the
+    settlement is strictly Pareto-dominated by a deal both parties *could* have
+    reached given their disclosed utilities.
+
+    This is the structural complement to the exchanged-offers check. A symmetric,
+    price-only ``alternating_offers`` baseline can only ever trade offers that form
+    a Pareto **antichain** (along any fixed deadline, price is a pure transfer), so
+    the exchanged-offers check can never flag it -- the dominating logrolling point
+    need never have been on the wire. The feasible-frontier check catches it. A
+    breakdown (no agreement) is not a failure; a pair missing either profile is
+    skipped.
+
+    Args:
+        events: Trace events (send/receive dicts parsed from JSONL).
+        grid_step: Integer stride for the price/deadline sweep (``1`` = exhaustive,
+            larger trades resolution for speed).
+        eps: Strict-dominance tolerance. A dominator must beat the agreement by more
+            than ``eps`` on at least one party; guards a near-optimal agreement under
+            RNG-seeded per-pair weights (see ``chainaim_multi_attribute_market.yaml``).
+
+    Example::
+
+        results = validate_negotiation_frontier(events, grid_step=1, eps=1e-9)
+    """
+    profiles, offers, agreements = _collect_negotiation(events)
+
+    violations: list[str] = []
+    skipped: list[str] = []
+    agreed = 0
+    breakdowns = 0
+
+    for pair in offers:
+        a, b = pair
+        if pair not in agreements:
+            breakdowns += 1
+            continue
+        pa = profiles.get(a)
+        pb = profiles.get(b)
+        if pa is None or pb is None:
+            skipped.append(f"{a}<->{b} (missing profile)")
+            continue
+        agreed += 1
+        agree_vals = agreements[pair]
+        ua_agree = _party_utility(agree_vals, pa)
+        ub_agree = _party_utility(agree_vals, pb)
+
+        dominator = _frontier_dominator(pa, pb, ua_agree, ub_agree, grid_step=grid_step, eps=eps)
+        if dominator is not None:
+            point, dua, dub = dominator
+            point_str = "/".join(f"{attr[0]}{val}" for attr, val in point.items())
+            violations.append(
+                f"{a}<->{b}: agreed {_fmt_point(agree_vals)} "
+                f"(U={ua_agree:.3f},{ub_agree:.3f}) dominated by feasible "
+                f"{point_str} (U={dua:.3f},{dub:.3f})"
+            )
+
+    if violations:
+        detail = "; ".join(violations)
+        if skipped:
+            detail += f" | skipped: {', '.join(skipped)}"
+        return [ValidationResult("negotiation_frontier_efficient", False, detail)]
+
+    detail = f"{agreed} agreement(s) on the feasible frontier, {breakdowns} breakdown(s)"
+    if skipped:
+        detail += f", {len(skipped)} skipped (missing profile)"
+    return [ValidationResult("negotiation_frontier_efficient", True, detail)]
+
+
+def validate_negotiation_disclosure(
+    events: list[dict[str, Any]],
+) -> list[ValidationResult]:
+    """Every agent that exchanges an offer must disclose its private profile once.
+
+    The Pareto-efficiency check can only recompute both parties' utilities from a
+    ``nego:profile`` disclosure, so an agent that bargains without disclosing would
+    evade scrutiny. This validator fails if any agent sent an offer/counter/accept
+    token but never sent a profile token -- a precondition guard for
+    :func:`validate_negotiation_pareto`.
+
+    Example::
+
+        results = validate_negotiation_disclosure(events)
+    """
+    attrs, field_keys, prefix = _neg_attr_schema(events)
+    disclosed: set[str] = set()
+    bargained: set[str] = set()
+    for ev in events:
+        if ev.get("kind") != "send":
+            continue
+        body = _message_body(ev)
+        if not body.startswith("nego:"):
+            continue
+        sender = str(ev.get("agent", ""))
+        prof = _NegProfile.parse_n(body, attrs, field_keys)
+        if prof is not None:
+            disclosed.add(prof.agent or sender)
+            continue
+        if _parse_neg_offer_n(body, attrs, prefix) is not None:
+            bargained.add(sender)
+
+    undisclosed = sorted(bargained - disclosed)
+    if undisclosed:
+        return [
+            ValidationResult(
+                "negotiation_profile_disclosed",
+                False,
+                f"agents bargained without disclosing a profile: {undisclosed}",
+            )
+        ]
+    return [
+        ValidationResult(
+            "negotiation_profile_disclosed",
+            True,
+            f"{len(bargained)} bargaining agent(s) all disclosed a profile",
+        )
+    ]
+
+
+def validate_negotiation_individual_rationality(
+    events: list[dict[str, Any]],
+    *,
+    eps: float = _NEG_EPS,
+    grid_step: int = 1,
+    breakdown_requires_surplus: bool = False,
+) -> list[ValidationResult]:
+    """No party accepts below its reservation, and no breakdown was avoidable.
+
+    Individual rationality (IR) has two faces, both keyed off each party's optional
+    self-disclosed ``rmin<u>`` reservation (a utility floor in ``[0, 1]`` on the
+    ``nego:profile`` token -- the party's BATNA / walk-away value):
+
+    * **Dominated acceptance** -- for every pair that reached agreement, FAIL if a
+      *disclosing* party's utility for the settlement is below its floor by more
+      than ``eps`` (a rational agent never signs below its walk-away value).
+    * **Unjustified breakdown** (above-spec) -- for every pair that broke down
+      (offers exchanged, no agreement) where **both** parties disclosed a
+      reservation, FAIL if some feasible point cleared both floors: a deal both
+      sides would have rationally accepted existed, so walking away was
+      irrational. Reuses the :func:`_frontier_dominator` feasible sweep via
+      :func:`_zopa_point`.
+
+    Both faces read only each agent's own disclosed reservation (anti-pattern (b)
+    safe) and **no-op to PASS** when the needed reservations are absent: acceptance
+    no-ops when no party disclosed; breakdown no-ops unless *both* did. So the
+    required 12-field ``chainaim_multi_attribute_market.yaml`` trace (no ``rmin``, and every
+    pair reaches agreement) is unaffected on both counts -- a strict superset of the
+    Iteration-1 behaviour.
+
+    Args:
+        events: Trace events (send/receive dicts parsed from JSONL).
+        eps: Tolerance; a utility must fall below a floor (acceptance) by more than
+            ``eps`` to count as a violation, and clearing a floor (breakdown) is
+            judged within ``eps``.
+        grid_step: Integer stride for the feasible breakdown sweep (``1`` =
+            exhaustive; larger trades resolution for speed). Acceptance is
+            unaffected by this.
+        breakdown_requires_surplus: When ``False`` (default, faithful to grounding
+            D.2) a breakdown is unjustified if a feasible point *weakly* clears both
+            reservations (``>=``). When ``True``, require a strict bilateral surplus
+            (both parties more than ``eps`` above their floor), ignoring ties on the
+            reservation line -- a stricter bar that only flags breakdowns leaving a
+            genuine mutual gain on the table.
+
+    Example::
+
+        results = validate_negotiation_individual_rationality(events)
+    """
+    profiles, offers, agreements = _collect_negotiation(events)
+
+    violations: list[str] = []
+    checked = 0
+    skipped_no_reservation = 0
+    skipped_missing_profile = 0
+    breakdowns_rational = 0
+
+    # Assertion 1 -- dominated acceptance (Iteration 1, unchanged).
+    for pair, agree_vals in agreements.items():
+        a, b = pair
+        pa = profiles.get(a)
+        pb = profiles.get(b)
+        if pa is None or pb is None:
+            skipped_missing_profile += 1
+            continue
+        pair_has_reservation = False
+        for prof in (pa, pb):
+            if prof.reservation is None:
+                continue
+            pair_has_reservation = True
+            u = _party_utility(agree_vals, prof)
+            if u < prof.reservation - eps:
+                violations.append(
+                    f"{a}<->{b}: {prof.agent} accepted "
+                    f"{_fmt_point(agree_vals)} at U={u:.3f} "
+                    f"below its reservation {prof.reservation:.3f}"
+                )
+        if pair_has_reservation:
+            checked += 1
+        else:
+            skipped_no_reservation += 1
+
+    # Assertion 2 -- unjustified breakdown (Iteration 2, above-spec). A breakdown is
+    # a pair that exchanged offers but never reached agreement. It is only judged
+    # when BOTH parties disclosed a reservation; otherwise it no-ops.
+    for pair in offers:
+        if pair in agreements:
+            continue
+        a, b = pair
+        pa = profiles.get(a)
+        pb = profiles.get(b)
+        if pa is None or pb is None:
+            skipped_missing_profile += 1
+            continue
+        if pa.reservation is None or pb.reservation is None:
+            continue
+        cleared = _zopa_point(
+            pa,
+            pb,
+            pa.reservation,
+            pb.reservation,
+            grid_step=grid_step,
+            eps=eps,
+            require_surplus=breakdown_requires_surplus,
+        )
+        if cleared is not None:
+            point, ua, ub = cleared
+            point_str = "/".join(f"{attr[0]}{val}" for attr, val in point.items())
+            violations.append(
+                f"{a}<->{b}: broke down though feasible {point_str} "
+                f"(U={ua:.3f},{ub:.3f}) cleared both reservations "
+                f"(rmin {pa.reservation:.3f},{pb.reservation:.3f})"
+            )
+        else:
+            breakdowns_rational += 1
+
+    if violations:
+        return [
+            ValidationResult(
+                "negotiation_individually_rational",
+                False,
+                "; ".join(violations),
+            )
+        ]
+    detail = (
+        f"{checked} agreement(s) individually rational, "
+        f"{skipped_no_reservation} without disclosed reservation"
+    )
+    if skipped_missing_profile:
+        detail += f", {skipped_missing_profile} skipped (missing profile)"
+    if breakdowns_rational:
+        detail += (
+            f"; {breakdowns_rational} breakdown(s) individually rational "
+            f"(no feasible deal cleared both reservations)"
+        )
+    return [ValidationResult("negotiation_individually_rational", True, detail)]
+
+
+def _pair_metrics(
+    pa: _NegProfile,
+    pb: _NegProfile,
+    agree_vals: dict[str, float],
+    *,
+    grid_step: int = 1,
+) -> dict[str, Any]:
+    """ANAC outcome-quality metrics for one agreed pair (reporting only).
+
+    Over the feasible region swept by :func:`_feasible_points`, computes three
+    standard Automated Negotiating Agents Competition (ANAC) outcome-space measures
+    for the agreement at ``agree_vals``:
+
+    * ``social_welfare`` -- the utilitarian sum ``u_a + u_b`` (higher is better).
+    * ``pareto_distance`` -- Euclidean distance from the agreement to the nearest
+      feasible Pareto-optimal point (``0`` iff the agreement is Pareto-optimal). The
+      frontier is found by an O(n log n) sort-and-sweep over the feasible set, not
+      an O(n^2) pairwise scan.
+    * ``nash_distance`` -- Euclidean distance to the feasible Nash bargaining point,
+      the point maximising the product of gains over the disagreement point. The
+      disagreement point is each party's disclosed ``rmin`` reservation, or ``0.0``
+      when undisclosed.
+
+    Reference: Baarslag et al., "Evaluating practical negotiating agents" (ANAC).
+    Reporting only -- nothing here feeds any validator verdict.
+
+    Example::
+
+        m = _pair_metrics(buyer, seller, {"price": 30, "deadline": 1})
+    """
+    ua_agree = _party_utility(agree_vals, pa)
+    ub_agree = _party_utility(agree_vals, pb)
+    d_a = pa.reservation if pa.reservation is not None else 0.0
+    d_b = pb.reservation if pb.reservation is not None else 0.0
+    nash_product = max(0.0, ua_agree - d_a) * max(0.0, ub_agree - d_b)
+
+    pts = list(_feasible_points(pa, pb, grid_step=grid_step))
+    if not pts:
+        return {
+            "utilities": [round(ua_agree, 6), round(ub_agree, 6)],
+            "social_welfare": round(ua_agree + ub_agree, 6),
+            "pareto_distance": None,
+            "nash_distance": None,
+            "nash_product": round(nash_product, 6),
+            "nash_point": None,
+        }
+
+    # Pareto frontier via sort-and-sweep skyline: sort by u_a desc (ties u_b desc),
+    # keep a point iff its u_b exceeds the running max -- O(n log n), not O(n^2).
+    ordered = sorted(pts, key=lambda t: (-t[1], -t[2]))
+    frontier: list[tuple[float, float]] = []
+    best_ub = float("-inf")
+    for _point, ua, ub in ordered:
+        if ub > best_ub + _NEG_EPS:
+            frontier.append((ua, ub))
+            best_ub = ub
+    pareto_distance = min(math.hypot(ua_agree - fua, ub_agree - fub) for fua, fub in frontier)
+
+    # Nash bargaining point: feasible point maximising the product of gains over the
+    # disagreement point (parties below their own floor are excluded).
+    nash_point: dict[str, int] | None = None
+    nash_uv: tuple[float, float] | None = None
+    best_product = float("-inf")
+    for point, ua, ub in pts:
+        gain_a = ua - d_a
+        gain_b = ub - d_b
+        if gain_a < 0.0 or gain_b < 0.0:
+            continue
+        product = gain_a * gain_b
+        if product > best_product + _NEG_EPS:
+            best_product = product
+            nash_point = point
+            nash_uv = (ua, ub)
+    nash_distance = (
+        math.hypot(ua_agree - nash_uv[0], ub_agree - nash_uv[1]) if nash_uv is not None else None
+    )
+
+    return {
+        "utilities": [round(ua_agree, 6), round(ub_agree, 6)],
+        "social_welfare": round(ua_agree + ub_agree, 6),
+        "pareto_distance": round(pareto_distance, 6),
+        "nash_distance": round(nash_distance, 6) if nash_distance is not None else None,
+        "nash_product": round(nash_product, 6),
+        "nash_point": nash_point,
+    }
+
+
+def negotiation_metrics(
+    events: list[dict[str, Any]],
+    *,
+    grid_step: int = 1,
+) -> dict[str, Any]:
+    """Per-pair ANAC outcome-quality metrics for a negotiation trace (reporting only).
+
+    Computes :func:`_pair_metrics` for every pair that reached agreement with both
+    profiles disclosed, plus an ``aggregate`` block (means and counts). Breakdowns
+    and pairs missing a profile are counted but not scored, since the metrics
+    describe *agreed* outcomes. **Verdict-neutral**: this never feeds the validators
+    in ``VALIDATORS`` -- it exists only for ``nest validate --metrics`` / ``--explain``.
+
+    Args:
+        events: Trace events (send/receive dicts parsed from JSONL).
+        grid_step: Integer stride for the feasible sweep (``1`` = exhaustive; larger
+            trades resolution for speed).
+
+    Example::
+
+        data = negotiation_metrics(events, grid_step=1)
+        data["aggregate"]["mean_pareto_distance"]
+    """
+    profiles, offers, agreements = _collect_negotiation(events)
+    pairs: dict[str, Any] = {}
+    breakdowns = 0
+    skipped_missing_profile = 0
+
+    for pair in offers:
+        a, b = pair
+        if pair not in agreements:
+            breakdowns += 1
+            continue
+        pa = profiles.get(a)
+        pb = profiles.get(b)
+        if pa is None or pb is None:
+            skipped_missing_profile += 1
+            continue
+        agree_vals = agreements[pair]
+        metrics = _pair_metrics(
+            pa,
+            pb,
+            agree_vals,
+            grid_step=grid_step,
+        )
+        metrics["agreement"] = {a: int(v) for a, v in agree_vals.items()}
+        pairs[f"{a}<->{b}"] = metrics
+
+    def _mean(key: str) -> float | None:
+        vals = [p[key] for p in pairs.values() if p.get(key) is not None]
+        return round(sum(vals) / len(vals), 6) if vals else None
+
+    aggregate = {
+        "pairs_scored": len(pairs),
+        "breakdowns": breakdowns,
+        "skipped_missing_profile": skipped_missing_profile,
+        "mean_social_welfare": _mean("social_welfare"),
+        "mean_pareto_distance": _mean("pareto_distance"),
+        "mean_nash_distance": _mean("nash_distance"),
+    }
+    return {"pairs": pairs, "aggregate": aggregate}
+
+
+def negotiation_explain(events: list[dict[str, Any]]) -> str:
+    """Return a per-session breakdown of weights, offer utilities, and dominance.
+
+    Used by ``nest validate --explain`` for the negotiation layer. Lists each
+    party's disclosed weights, every exchanged offer's utility pair, the
+    exchanged-offer frontier (the non-dominated set among them, distinct from the
+    *feasible* frontier that ``validate_negotiation_frontier`` sweeps), and -- for
+    the agreement -- whether any exchanged offer dominates it.
+
+    Example::
+
+        print(negotiation_explain(events))
+    """
+    profiles, offers, agreements = _collect_negotiation(events)
+    lines: list[str] = []
+    for pair in sorted(offers):
+        a, b = pair
+        lines.append(f"session {a} <-> {b}")
+        pa = profiles.get(a)
+        pb = profiles.get(b)
+        if pa is None or pb is None:
+            lines.append("  (missing profile disclosure -- cannot score)")
+            continue
+        lines.append(f"  {a} weights: {pa.weights}")
+        lines.append(f"  {b} weights: {pb.weights}")
+        scored: list[tuple[dict[str, float], float, float]] = []
+        for _origin, ovals in offers[pair]:
+            scored.append((ovals, _party_utility(ovals, pa), _party_utility(ovals, pb)))
+        for ovals, ua, ub in scored:
+            lines.append(f"  offer {_fmt_point(ovals)}: U=({ua:.3f}, {ub:.3f})")
+        frontier = [
+            (ovals, ua, ub)
+            for (ovals, ua, ub) in scored
+            if not any(
+                (oua >= ua - _NEG_EPS and oub >= ub - _NEG_EPS)
+                and (oua > ua + _NEG_EPS or oub > ub + _NEG_EPS)
+                for (_ov, oua, oub) in scored
+            )
+        ]
+        front_str = ", ".join(_fmt_point(ovals) for ovals, _ua, _ub in frontier)
+        lines.append(f"  exchanged-offer frontier: {front_str}")
+        if pair in agreements:
+            avals = agreements[pair]
+            ua_a = _party_utility(avals, pa)
+            ub_a = _party_utility(avals, pb)
+            lines.append(f"  agreement {_fmt_point(avals)}: U=({ua_a:.3f}, {ub_a:.3f})")
+            dominators = [
+                _fmt_point(ovals)
+                for ovals, ua, ub in scored
+                if (ua >= ua_a - _NEG_EPS and ub >= ub_a - _NEG_EPS)
+                and (ua > ua_a + _NEG_EPS or ub > ub_a + _NEG_EPS)
+            ]
+            if dominators:
+                lines.append(f"  DOMINATED BY: {', '.join(dominators)}")
+            else:
+                lines.append("  Pareto-efficient: no exchanged offer dominates")
+            _m = _pair_metrics(pa, pb, avals)
+            _nd = "n/a" if _m["nash_distance"] is None else f"{_m['nash_distance']:.3f}"
+            _pd = "n/a" if _m["pareto_distance"] is None else f"{_m['pareto_distance']:.3f}"
+            lines.append(
+                f"  metrics: welfare={_m['social_welfare']:.3f}  pareto_dist={_pd}  nash_dist={_nd}"
+            )
+        else:
+            lines.append("  breakdown (no agreement)")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Failure-detection validators
 # ---------------------------------------------------------------------------
@@ -4132,5 +5144,11 @@ VALIDATORS: dict[str, list[Any]] = {
     "failure_detection": [
         validate_failure_detection_completeness,
         validate_failure_detection_accuracy,
+    ],
+    "negotiation": [
+        validate_negotiation_pareto,
+        validate_negotiation_disclosure,
+        validate_negotiation_frontier,
+        validate_negotiation_individual_rationality,
     ],
 }

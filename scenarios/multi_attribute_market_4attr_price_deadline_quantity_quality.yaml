@@ -1,0 +1,135 @@
+# SPDX-License-Identifier: Apache-2.0
+# Multi-attribute negotiation market over FOUR attributes -- PRICE + DEADLINE + QUANTITY + QUALITY.
+# (Problem-07, Option D: a coarse-tier 4-attribute extension of the price+deadline+quantity demo.)
+#
+# This scenario is purely ADDITIVE: it reuses the N-generic `negotiation_multi` factory and the
+# ChainAim Pareto plugin AS-IS (no code change), and adds a fourth OPPOSED attribute `quality`.
+# The exhaustive feasible-frontier validator (`_feasible_points` -> `validate_negotiation_frontier`)
+# is already N-generic, so it certifies the 4-attr settlement with no validator change.
+#
+# COARSE ORDINAL TIERS (load-bearing for runtime). Option D = the feasible-frontier audit sweeps the
+# INTEGER intersection of both parties' bound-boxes EXHAUSTIVELY (grid_step=1, fixed inside the public
+# validator -- it is NOT tunable from this YAML). At four axes the lattice is the PRODUCT of the axis
+# sizes, so real-unit ranges (e.g. price [300,1000] = 701 points) make the 4-D sweep intractable. We
+# therefore model every axis as a small ordinal tier index (<= ~11 values/axis): the lattice is
+# 11 x 6 x 11 x 6 = 4356 points/pair -- exact AND instant. Tier indices are the natural encoding for
+# discrete supplier-quote domains (price band, settlement bucket, MOQ band, quality grade).
+#
+# Direction signs (all FOUR opposed -> non-degenerate frontier):
+#   price    -- price-band index [0,10]: buyer LOW (-1), seller HIGH (+1).
+#   deadline -- settlement-window bucket [1,6]: buyer LONG (+1), seller SHORT (-1)
+#               (factory DEFAULT deadline signs; no override needed).
+#   quantity -- MOQ band [0,10] under a total price: buyer MORE (+1), seller FEWER (-1) -> OPPOSED.
+#   quality  -- grade [0,5]: buyer HIGH (+1), seller LOW (-1) -> OPPOSED.
+#
+# Logrolling structure (a clean 4-way trade): quantity is the BUYER's chip (buyer weights it HIGH,
+# won't give units away; seller concedes units cheaply), and quality is the SELLER's chip (seller
+# weights it HIGH, won't lower grade; buyer concedes quality cheaply). price/deadline split as in the
+# 2-attr base draw (deadline owns the price-complement). So each side holds one integrative chip and
+# concedes the other, mirroring how `quantity` logrolls in the 3-attr scenario.
+#
+# WIRE PREFIXES (load-bearing -- the validator recovers extra axes by the single char of each weight
+# token, so every prefix MUST be a DISTINCT SINGLE CHAR): price `p`, deadline `d`, quantity `n`
+# (set explicitly to avoid the single-letter collision with quality's default `q`), quality `q`.
+# Offers carry `:p<>:d<>:n<>:q<>`; profiles disclose wp/wd/wn/wq, pmin.. dmin.. nmin.. qmin.., dir_*.
+#
+# Verify with:
+#   uv run pytest packages/nest-core/tests/test_negotiation_price_deadline_quantity_quality.py -v
+# Generate the trace for inspection with:
+#   uv run nest run scenarios/multi_attribute_market_4attr_price_deadline_quantity_quality.yaml
+name: multi_attribute_market_4attr_price_deadline_quantity_quality
+description: "10 buyer/seller pairs, price+deadline+quantity+quality (all opposed, coarse ordinal tiers), ChainAim Pareto plugin (4-attr Option D)."
+
+tier: 1
+seed: 42
+
+agents:
+  count: 20
+  brain: state-machine
+  roles:
+    - name: buyer
+      count: 10
+    - name: seller
+      count: 10
+
+layers:
+  transport: in_memory
+  comms: nest_native
+  identity: did_key
+  registry: in_memory
+  auth: jwt
+  trust: score_average
+  payments: prepaid_credits
+  coordination: contract_net
+  negotiation: chainaim_neg_multi_pareto
+  memory: blackboard
+  privacy: noop
+  datafacts: datafacts_v1
+
+task:
+  type: negotiation_multi
+  config:
+    # --- the attribute vector (fourth attribute `quality`) ---
+    attributes: [price, deadline, quantity, quality]
+
+    # --- price: price-band tier index [0,10] (0 = cheapest) ---
+    price_min: 0
+    price_max: 10
+    buyer_open_price: 0       # buyer opens at its ideal (cheapest band)
+    seller_anchor: 10         # seller opens dear
+    buyer_target: 7           # naive self-concession ceiling (plugin frontier walk does the real trade)
+    seller_target: 5          # naive self-concession floor
+    price_step: 1             # one tier per round
+
+    # --- deadline: settlement-window bucket [1,6] (default signs: buyer +1 long / seller -1 short) ---
+    deadline_min: 1
+    deadline_max: 6
+    buyer_open_deadline: 6    # buyer opens long
+    naive_deadline: 3         # mid bucket
+
+    patience: 0.9
+    max_rounds: 12
+    # grid_points left at the plugin default (15); >= every axis size, so the plugin can propose any tier.
+
+    # --- quantity: OPPOSED (the BUYER's logrolling chip), MOQ band [0,10] ---
+    quantity_min: 0
+    quantity_max: 10
+    quantity_prefix: n            # distinct single-char prefix (avoids the q-collision with quality)
+    buyer_dir:
+      quantity: 1                 # buyer: MORE units better
+      quality: 1                  # buyer: HIGHER grade better
+    seller_dir:
+      quantity: -1                # seller: FEWER units better
+      quality: -1                 # seller: LOWER grade better (cheaper to produce)
+    buyer_w_quantity_range: [0.30, 0.40]   # buyer holds quantity (won't give units away)
+    seller_w_quantity_range: [0.05, 0.12]  # seller concedes units cheaply
+    quantity_open_buyer: 10       # buyer opens at its quantity ideal (many)
+    quantity_open_seller: 0       # seller opens at its quantity ideal (few)
+    quantity_concede: pin         # plugin frontier walk does the real trading
+
+    # --- quality: the FOURTH attribute, OPPOSED (the SELLER's logrolling chip), grade [0,5] ---
+    quality_min: 0
+    quality_max: 5
+    quality_prefix: q             # distinct single-char prefix (default a[0]='q'; set for clarity)
+    buyer_w_quality_range: [0.05, 0.12]    # buyer concedes quality cheaply
+    seller_w_quality_range: [0.30, 0.40]   # seller holds quality (won't lower the grade)
+    quality_open_buyer: 5         # buyer opens at its quality ideal (high grade)
+    quality_open_seller: 0        # seller opens at its quality ideal (low grade)
+    quality_concede: pin          # plugin frontier walk trades it (same discipline as quantity)
+    # NOTE: buyer_w_price / seller_w_price intentionally unset -- per-pair price/deadline weights are
+    # seeded from `seed` (buyer price-heavy / seller deadline-heavy ranges), so the 10 pairs differ
+    # yet replay deterministically. The extra quantity/quality weights draw AFTER the price/deadline
+    # draw, so they never perturb the base split.
+
+failures:
+  message_drop: 0.0
+
+duration: "ticks: 10000"
+
+metrics:
+  - success_rate
+  - mean_latency
+  - message_count
+
+output:
+  trace: ./traces/multi_attribute_market_4attr_price_deadline_quantity_quality.jsonl

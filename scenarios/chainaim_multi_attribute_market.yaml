@@ -1,0 +1,79 @@
+# SPDX-License-Identifier: Apache-2.0
+# Multi-attribute negotiation market (Problem-07, PASS demo).
+#
+# 10 buyer/seller pairs bargain over TWO attributes -- price and deadline -- using
+# the ChainAim multi-attribute Pareto plugin (`chainaim_neg_multi_pareto`). Each
+# agent has a private weighted utility (buyers weight price more, sellers weight
+# deadline more), so logrolling room exists: a party concedes the attribute it
+# values less to gain on the one it values more. Per-pair weights are derived
+# deterministically from the per-agent seeded RNG (SC5) -- heterogeneous across the
+# 10 pairs yet replayable -- rather than hardcoded. The plugin's frontier-walking
+# `respond` converges on agreements that are Pareto-efficient among the offers
+# exchanged -- so `nest validate <trace> --scenario negotiation` reports PASS.
+#
+# This scenario is identical to `multi_attribute_baseline.yaml` EXCEPT for the
+# `layers.negotiation` selector, so the two isolate the effect of the strategy.
+name: chainaim_multi_attribute_market
+description: "10 buyer/seller pairs, price+deadline, ChainAim Pareto plugin (PASS demo)."
+
+tier: 1
+seed: 42
+
+agents:
+  count: 20
+  brain: state-machine
+  roles:
+    - name: buyer
+      count: 10
+    - name: seller
+      count: 10
+
+layers:
+  transport: in_memory
+  comms: nest_native
+  identity: did_key
+  registry: in_memory
+  auth: jwt
+  trust: score_average
+  payments: prepaid_credits
+  coordination: contract_net
+  negotiation: chainaim_neg_multi_pareto
+  memory: blackboard
+  privacy: noop
+  datafacts: datafacts_v1
+
+task:
+  type: negotiation_multi
+  config:
+    price_min: 30           # shared price bounds
+    price_max: 100
+    deadline_min: 1         # `deadline` = buyer's SETTLEMENT WINDOW (net-30/60): buyer wants it
+    deadline_max: 30        #   long (keep cash longer), seller short (collect sooner). For the
+                            #   DELIVERY-lead-time reading of the same slot (signs flipped) see
+                            #   scenarios/multi_attribute_leadtime.yaml.
+    buyer_open_price: 30    # buyer opens at its ideal: cheap ...
+    buyer_open_deadline: 30 #   ... and long (buyer values a long deadline)
+    seller_anchor: 95       # seller opens dear
+    buyer_target: 70        # naive price meeting points (used only on self-concession)
+    seller_target: 60
+    naive_deadline: 15      # mid deadline used by price-only self-concession
+    price_step: 5           # naive concession size per round
+    patience: 0.9           # plugin aspiration discount
+    max_rounds: 12          # per-session safety cap
+    # NOTE: buyer_w_price / seller_w_price are intentionally NOT set here. Omitting
+    # them makes `_pair_weights` seed each pair's weights from `seed` (SC5) within
+    # buyer-price-heavy / seller-deadline-heavy ranges, so the 10 pairs differ but
+    # replay deterministically. Set them only to pin a single fixed weighting.
+
+failures:
+  message_drop: 0.0
+
+duration: "ticks: 10000"
+
+metrics:
+  - success_rate
+  - mean_latency
+  - message_count
+
+output:
+  trace: ./traces/chainaim_multi_attribute_market.jsonl

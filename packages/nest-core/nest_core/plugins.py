@@ -37,6 +37,14 @@ _BUILTINS: dict[tuple[str, str], str] = {
         f"{_REF}.negotiation.alternating_offers:AlternatingOffers"
     ),
     ("negotiation", "pareto"): f"{_REF}.negotiation.pareto:ParetoNegotiation",
+    # ChainAim multi-attribute Pareto-frontier negotiation plugin (Problem-07,
+    # success-criterion 1: "registered ... in nest_core/plugins.py"). Also exposed
+    # via the nest.plugins.negotiation entry point, which resolve() consults first,
+    # so this built-in entry is a literal-spec alias and the committed golden trace
+    # is unchanged.
+    ("negotiation", "chainaim_neg_multi_pareto"): (
+        f"{_REF}.negotiation.chainaim_neg_multi_pareto:ChainAimMultiAttributeNegotiation"
+    ),
     ("memory", "blackboard"): f"{_REF}.memory.blackboard:Blackboard",
     ("memory", "lww_register"): f"{_REF}.memory.lww_register:LwwRegisterMemory",
     ("privacy", "noop"): f"{_REF}.privacy.noop:NoopPrivacy",
