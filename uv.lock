@@ -1405,6 +1405,7 @@ version = "0.1.1"
 source = { editable = "packages/nest-plugins-reference" }
 dependencies = [
     { name = "cryptography" },
+    { name = "httpx" },
     { name = "nest-core" },
     { name = "nest-sdk" },
 ]
@@ -1412,6 +1413,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "cryptography", specifier = ">=42.0" },
+    { name = "httpx", specifier = ">=0.27" },
     { name = "nest-core", editable = "packages/nest-core" },
     { name = "nest-sdk", editable = "packages/nest-sdk" },
 ]

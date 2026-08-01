@@ -1,0 +1,87 @@
+# SPDX-License-Identifier: Apache-2.0
+# Prava commerce: buyer/seller pairs settling on a Prava mandate.
+#
+# Deliberately SMALL. A marketplace-sized run (50 buyers x 50 sellers x 10
+# rounds) would exhaust a real sandbox mandate cap long before finishing, so
+# this scenario proves the rail rather than stress-testing it.
+#
+# DEFAULT MODE IS `simulated`. That runs against SimulatedPravaTransport, an
+# in-process test double: no network, no money, no credentials, and a
+# byte-identical trace for a given seed. This is what CI runs, because CI holds
+# no Prava key.
+#
+# To settle for real against the Prava sandbox:
+#   1. Provision a mandate out of band (POST /v1/sessions + human passkey tap).
+#      A mandate cannot be created mid-simulation, so the id is injected here.
+#   2. export PRAVA_API_KEY=sk_test_...      # NEVER put the key in this file
+#   3. Set mode: live and mandate_id: mdt_<yours> below.
+# A live run makes real network calls, so the "same seed -> byte-identical
+# trace" guarantee no longer holds. That is disclosed here and in the README.
+
+name: prava_commerce
+description: |
+  Two buyer/seller pairs exercise the Prava payments rail end to end:
+  quote -> pay -> replay the same PaymentRef (Prava dedupes, no double
+  charge) -> verify against Prava's own ledger -> attempt an oversized
+  charge (refused with THRESHOLD_EXCEEDED) -> request a refund (raises,
+  because the Prava API defines no refund endpoint).
+
+tier: 1
+seed: 42
+
+agents:
+  count: 4
+  brain: state-machine
+  roles:
+    - name: buyer
+      count: 2
+      config: {}
+    - name: seller
+      count: 2
+      config: {}
+
+layers:
+  transport: in_memory
+  comms: nest_native
+  identity: did_key
+  registry: in_memory
+  auth: jwt
+  trust: score_average
+  payments: prava
+  coordination: contract_net
+  negotiation: alternating_offers
+  memory: blackboard
+  privacy: noop
+  datafacts: datafacts_v1
+
+task:
+  type: prava_commerce
+  config:
+    pairs: 2
+    # ----- rail selection -------------------------------------------------
+    mode: simulated              # simulated | live
+    prava_env: sandbox           # sandbox | production
+    mandate_id: mdt_simulated_demo
+    # ----- money ----------------------------------------------------------
+    currency: USD
+    minor_unit_exponent: 2       # 0 for zero-decimal currencies (JPY, KRW)
+    unit_price_minor: 4000       # "40.00"
+    cap_minor: 100000            # "1000.00"; simulated-mode mandate ceiling
+    overcap_minor: 99999900      # oversized on purpose -> THRESHOLD_EXCEEDED
+    # ----- behaviour ------------------------------------------------------
+    fail_closed: true            # an unconfirmed charge is a failure, never a success
+    timeout_s: 30.0
+    max_retries: 3
+
+failures:
+  message_drop: 0.0
+  byzantine_agents: 0.0
+
+duration: "ticks: 200"
+
+metrics:
+  - message_count
+  - agent_count
+
+output:
+  trace: ./traces/prava_commerce.jsonl
