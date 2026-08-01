@@ -36,6 +36,18 @@ provider / service binding by payment reference and reject traces that leak
 private keys, API keys, bearer tokens, wallet secrets, or other live rail
 secrets.
 
+`prava` — settles on Visa rails through
+[Prava](https://docs.prava.space)'s agentic-payments mandate API. The
+only payments plugin here that does not settle against a Python
+dictionary. `PaymentRef` is passed through verbatim as Prava's
+`reference` idempotency key, so replaying a simulation is refused by the
+card network rather than by local bookkeeping. `refund` raises rather
+than no-ops, because the Prava API defines no reversal endpoint. Ships
+a simulated transport (a loudly labelled test double, used by CI, which
+holds no credentials) alongside the live one, selected by a `mode` flag.
+
+Details: [`prava_payments.md`](prava_payments.md).
+
 ## Writing your own
 
 See [`writing-a-plugin.md`](../writing-a-plugin.md) — the full
