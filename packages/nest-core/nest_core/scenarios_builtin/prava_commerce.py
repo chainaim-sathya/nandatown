@@ -49,18 +49,22 @@ from nest_core.sim.agent import AgentContext, StateMachineAgent
 from nest_core.types import AgentId, Money, PaymentRef, ServiceRef
 
 _TICK_QUOTE = 1.0
+_TICK_DELIVERY = 2.0
 _TICK_PAY = 3.0
 _TICK_REPLAY = 5.0
 _TICK_VERIFY = 7.0
 _TICK_OVERCAP = 9.0
 _TICK_REFUND = 11.0
+_TICK_RETURN = 13.0
 
 _OP_QUOTE = b"op:quote"
+_OP_DELIVERY = b"op:delivery"
 _OP_PAY = b"op:pay"
 _OP_REPLAY = b"op:replay"
 _OP_VERIFY = b"op:verify"
 _OP_OVERCAP = b"op:overcap"
 _OP_REFUND = b"op:refund"
+_OP_RETURN = b"op:return"
 
 DEFAULT_PAIRS = 2
 """Number of buyer/seller pairs when ``task.config`` does not say.
@@ -189,6 +193,9 @@ class PravaBuyerAgent(StateMachineAgent):
         overcap_minor: int,
         currency: str,
         service_ref: str | None = None,
+        delivery_product_id: str | None = None,
+        delivery_merchant: str | None = None,
+        days_since_delivery: int | None = None,
     ) -> None:
         self._id = agent_id
         self._seller = seller
@@ -198,7 +205,11 @@ class PravaBuyerAgent(StateMachineAgent):
         self._overcap_minor = overcap_minor
         self._currency = currency
         self._service_ref = service_ref if service_ref else f"svc-{seller}"
+        self._delivery_product_id = delivery_product_id
+        self._delivery_merchant = delivery_merchant
+        self._days_since_delivery = days_since_delivery
         self._quoted_minor: int | None = None
+        self._paid = False
 
     def _charge_minor(self) -> int:
         """Amount to charge: the quoted price once quoted, else the configured one.
@@ -215,11 +226,15 @@ class PravaBuyerAgent(StateMachineAgent):
 
     async def on_start(self, ctx: AgentContext) -> None:
         await ctx.schedule(_TICK_QUOTE, _OP_QUOTE)
+        if self._delivery_product_id is not None:
+            await ctx.schedule(_TICK_DELIVERY, _OP_DELIVERY)
         await ctx.schedule(_TICK_PAY, _OP_PAY)
         await ctx.schedule(_TICK_REPLAY, _OP_REPLAY)
         await ctx.schedule(_TICK_VERIFY, _OP_VERIFY)
         await ctx.schedule(_TICK_OVERCAP, _OP_OVERCAP)
         await ctx.schedule(_TICK_REFUND, _OP_REFUND)
+        if self._days_since_delivery is not None:
+            await ctx.schedule(_TICK_RETURN, _OP_RETURN)
 
     async def on_message(self, ctx: AgentContext, sender: AgentId, payload: bytes) -> None:
         payments = ctx.plugins["payments"]
@@ -249,6 +264,10 @@ class PravaBuyerAgent(StateMachineAgent):
             return
 
         money = Money(amount=self._charge_minor(), currency=self._currency)
+
+        if payload == _OP_DELIVERY:
+            await self._announce_delivery(ctx, mode)
+            return
 
         if payload == _OP_PAY:
             await self._attempt_pay(ctx, money, self._ref, mode, kind="paid")
@@ -280,6 +299,102 @@ class PravaBuyerAgent(StateMachineAgent):
 
         if payload == _OP_REFUND:
             await self._attempt_refund(ctx, mode)
+            return
+
+        if payload == _OP_RETURN:
+            await self._request_return(ctx, mode)
+
+    async def _announce_delivery(self, ctx: AgentContext, mode: str) -> None:
+        """Record what is being delivered, then judge it against the certified intent.
+
+        The verdict is broadcast before the pay tick, so a reader sees the check
+        that decided whether a charge was ever attempted.
+
+        Example::
+
+            await agent._announce_delivery(ctx, "simulated")
+        """
+        payments = ctx.plugins["payments"]
+        record = getattr(payments, "record_delivery", None)
+        if record is None:
+            return
+        record(product_id=self._delivery_product_id, merchant=self._delivery_merchant)
+        fields: dict[str, str | int] = {
+            "kind": "delivery",
+            "buyer": str(self._id),
+            "product": str(self._delivery_product_id),
+            "merchant": str(self._delivery_merchant or "unspecified"),
+            "amount": int(self._charge_minor()),
+            "mode": mode,
+        }
+        await ctx.broadcast(_emit(fields))
+
+        check = getattr(payments, "check_delivery", None)
+        if check is None:
+            return
+        result = check(amount_minor=self._charge_minor())
+        verdict: dict[str, str | int] = {
+            "kind": "conformance",
+            "buyer": str(self._id),
+            "result": "pass" if bool(getattr(result, "passed", False)) else "fail",
+            "reason": str(getattr(result, "reason", "unknown")),
+        }
+        for check_item in getattr(result, "checks", ()):
+            if not bool(getattr(check_item, "passed", True)):
+                verdict["expected"] = str(getattr(check_item, "expected", ""))
+                verdict["actual"] = str(getattr(check_item, "actual", ""))
+                break
+        verdict["mode"] = mode
+        await ctx.broadcast(_emit(verdict))
+
+    async def _request_return(self, ctx: AgentContext, mode: str) -> None:
+        """Ask whether a return falls inside the certified window.
+
+        An approved verdict means the request conforms to terms agreed before
+        the purchase. It does not mean money moved: the Prava API defines no
+        reversal endpoint, so settlement of an approved return happens off this
+        rail. The broadcast says so rather than implying a credit.
+
+        Example::
+
+            await agent._request_return(ctx, "simulated")
+        """
+        payments = ctx.plugins["payments"]
+        judge = getattr(payments, "judge_return", None)
+        if judge is None or self._days_since_delivery is None:
+            return
+        if not self._paid:
+            await ctx.broadcast(
+                _emit(
+                    {
+                        "kind": "return",
+                        "ref": str(self._ref),
+                        "result": "not_applicable",
+                        "reason": "no_settled_purchase",
+                        "day": int(self._days_since_delivery),
+                        "mode": mode,
+                    }
+                )
+            )
+            return
+        try:
+            verdict = judge(days_since_delivery=self._days_since_delivery)
+        except (RuntimeError, ValueError):
+            return
+        approved = bool(getattr(verdict, "approved", False))
+        window = getattr(verdict, "window_days", None)
+        fields: dict[str, str | int] = {
+            "kind": "return",
+            "ref": str(self._ref),
+            "result": "approved" if approved else "denied",
+            "reason": str(getattr(verdict, "reason", "unknown")),
+            "day": int(self._days_since_delivery),
+            "window": int(window) if isinstance(window, int) else -1,
+        }
+        if approved:
+            fields["settlement"] = "unavailable_on_rail"
+        fields["mode"] = mode
+        await ctx.broadcast(_emit(fields))
 
     async def _attempt_pay(
         self,
@@ -323,6 +438,8 @@ class PravaBuyerAgent(StateMachineAgent):
                 }
             )
         )
+        if ref == self._ref:
+            self._paid = True
 
     async def _attempt_refund(self, ctx: AgentContext, mode: str) -> None:
         payments = ctx.plugins["payments"]
@@ -391,8 +508,17 @@ def prava_commerce_factory(
 
     ``pairs``, ``mandate_id``, ``mode``, ``prava_env``, ``currency``,
     ``minor_unit_exponent``, ``unit_price_minor``, ``intent_snapshot``,
+    ``require_conformance``, ``delivery``, ``days_since_delivery``,
     ``cap_minor``, ``overcap_minor``, ``fail_closed``, ``timeout_s``,
     ``max_retries``, ``authorization_code``.
+
+    ``require_conformance`` is opt-in and defaults to ``False``. Only when it is
+    set does the plugin receive the certified intent and gate ``pay`` on it, so
+    an existing scenario that merely names an ``intent_snapshot`` keeps its
+    previous behaviour byte for byte. ``delivery`` (``product_id``,
+    ``merchant``) is what a counterparty claims to be shipping, and
+    ``days_since_delivery`` drives the return verdict -- supplied as config
+    rather than read from the clock so the trace stays reproducible.
 
     ``intent_snapshot`` is a path to a frozen purchase-intent file describing an
     item an upstream LLM shopper selected. When present it supplies the service
@@ -429,6 +555,16 @@ def prava_commerce_factory(
         service_ref, unit_price_minor, intent_digest = _load_intent_snapshot(str(snapshot_path))
         price_book = {service_ref: unit_price_minor}
 
+    require_conformance = bool(task_config.get("require_conformance", False))
+    delivery_raw = task_config.get("delivery")
+    delivery: dict[str, Any] = (
+        cast("dict[str, Any]", delivery_raw) if isinstance(delivery_raw, dict) else {}
+    )
+    delivery_product_id = delivery.get("product_id")
+    delivery_merchant = delivery.get("merchant")
+    days_raw = task_config.get("days_since_delivery")
+    days_since_delivery = int(days_raw) if days_raw is not None else None
+
     plugin_kwargs: dict[str, Any] = {
         "mandate_id": str(task_config.get("mandate_id", "mdt_simulated_demo")),
         "mode": str(task_config.get("mode", "simulated")),
@@ -438,6 +574,7 @@ def prava_commerce_factory(
         "unit_price_minor": unit_price_minor,
         "price_book": price_book,
         "intent_digest": intent_digest,
+        "intent_snapshot": str(snapshot_path) if (snapshot_path and require_conformance) else None,
         "cap_minor": int(task_config.get("cap_minor", 100_000)),
         "fail_closed": bool(task_config.get("fail_closed", True)),
         "timeout_s": float(task_config.get("timeout_s", 30.0)),
@@ -462,6 +599,9 @@ def prava_commerce_factory(
             overcap_minor=overcap_minor,
             currency=currency,
             service_ref=service_ref,
+            delivery_product_id=(str(delivery_product_id) if delivery_product_id else None),
+            delivery_merchant=(str(delivery_merchant) if delivery_merchant else None),
+            days_since_delivery=days_since_delivery,
         )
         agents[seller_id] = PravaSellerAgent(seller_id)
 

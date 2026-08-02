@@ -80,6 +80,16 @@ from nest_plugins_reference.payments.prava_client import (
     PravaTransport,
     SimulatedPravaTransport,
 )
+from nest_plugins_reference.payments.prava_intent import (
+    ConformanceResult,
+    PurchaseIntent,
+    ReturnVerdict,
+    check_conformance,
+    load_intent,
+)
+from nest_plugins_reference.payments.prava_intent import (
+    judge_return as _judge_return,
+)
 
 MODE_SIMULATED = "simulated"
 """Run against the in-process test double. No money moves.
@@ -158,6 +168,31 @@ class PravaRefundUnsupportedError(NotImplementedError):
     """
 
 
+class PravaConformanceError(PravaPaymentError):
+    """Raised when a delivery does not match the certified purchase intent.
+
+    Raised *before* any network call, so a non-conforming purchase leaves no
+    trace at the payment rail: no charge, no credential, nothing to reverse.
+
+    The failure this exists for is a *cheaper* substitution. An item that costs
+    less than the quoted price passes every amount-based control -- Visa's
+    decline threshold, the mandate cap, the network's own ceiling -- because
+    each of those asks only how much. Comparing the delivery to the certified
+    intent is what catches an item the user never authorised.
+
+    Example::
+
+        try:
+            await payments.pay(seller, amount, ref)
+        except PravaConformanceError as exc:
+            print(exc.result.reason)
+    """
+
+    def __init__(self, message: str, result: ConformanceResult) -> None:
+        self.result = result
+        super().__init__(message, over_cap=False, code="INTENT_NONCONFORMANT")
+
+
 class PravaPayments:
     """Nanda Town payments plugin backed by the Prava mandate API.
 
@@ -176,6 +211,8 @@ class PravaPayments:
     ``unit_price_minor``        ``4_000``      Fallback price when no price book.
     ``price_book``              ``None``       ``service_ref -> minor units``.
     ``intent_digest``           ``None``       Snapshot digest, stamped on quotes.
+    ``intent``                  ``None``       Certified intent; enables the gate.
+    ``intent_snapshot``         ``None``       Path to load that intent from.
     ``cap_minor``               ``100_000``    Simulated-mode mandate ceiling.
     ``fail_closed``             ``True``       See below.
     ``timeout_s``               ``30.0``       Live transport only.
@@ -218,6 +255,8 @@ class PravaPayments:
         unit_price_minor: int = 4_000,
         price_book: dict[str, int] | None = None,
         intent_digest: str | None = None,
+        intent: PurchaseIntent | None = None,
+        intent_snapshot: str | None = None,
         cap_minor: int = 100_000,
         fail_closed: bool = True,
         timeout_s: float = 30.0,
@@ -248,6 +287,11 @@ class PravaPayments:
         self._unit_price_minor = unit_price_minor
         self._price_book = dict(price_book) if price_book is not None else None
         self._intent_digest = intent_digest
+        if intent is None and intent_snapshot:
+            intent = load_intent(intent_snapshot, expected_currency=currency)
+        self._intent = intent
+        self._delivered_product_id: str | None = None
+        self._delivered_merchant: str | None = None
         self._fail_closed = fail_closed
         self._authorization_code = authorization_code
         self._receipts: dict[PaymentRef, Receipt] = receipts if receipts is not None else {}
@@ -350,6 +394,81 @@ class PravaPayments:
         """
         return self._confirmed.get(ref, False)
 
+    # -- intent conformance ----------------------------------------------
+
+    @property
+    def intent(self) -> PurchaseIntent | None:
+        """The certified purchase intent this plugin gates against, if any.
+
+        Example::
+
+            if payments.intent is not None:
+                print(payments.intent.sku)
+        """
+        return self._intent
+
+    def record_delivery(
+        self,
+        product_id: str | None = None,
+        merchant: str | None = None,
+    ) -> None:
+        """Record what a counterparty says it is actually delivering.
+
+        Held on the plugin rather than passed to :meth:`pay`, whose signature is
+        fixed by the ``Payments`` protocol. Recording is optional: with no
+        delivery recorded the gate still judges the *selection* against the
+        certified terms.
+
+        Example::
+
+            payments.record_delivery(product_id="98115-2XL", merchant="Libas")
+        """
+        self._delivered_product_id = product_id
+        self._delivered_merchant = merchant
+
+    def check_delivery(self, amount_minor: int | None = None) -> ConformanceResult:
+        """Judge the recorded delivery against the certified intent.
+
+        Returns a passing, empty result when no intent is configured, so a
+        scenario without a certificate behaves exactly as it did before.
+
+        Example::
+
+            result = payments.check_delivery(amount_minor=472)
+            print(result.passed, result.reason)
+        """
+        if self._intent is None:
+            return ConformanceResult(passed=True)
+        return check_conformance(
+            self._intent,
+            delivered_product_id=self._delivered_product_id,
+            delivered_amount_minor=amount_minor,
+            delivered_merchant=self._delivered_merchant,
+        )
+
+    def judge_return(self, days_since_delivery: int) -> ReturnVerdict:
+        """Decide whether a return request falls inside the certified window.
+
+        ``days_since_delivery`` is supplied by the caller, never read from the
+        clock, so the verdict is reproducible.
+
+        An approved verdict means the request conforms to terms agreed before
+        the purchase. It does not mean money moved: see
+        :class:`PravaRefundUnsupportedError`.
+
+        Example::
+
+            verdict = payments.judge_return(days_since_delivery=5)
+            assert verdict.approved
+
+        Raises:
+            PravaConfigError: If no certified intent is configured.
+        """
+        if self._intent is None:
+            msg = "judge_return needs a certified intent; none was configured on this plugin"
+            raise PravaConfigError(msg)
+        return _judge_return(self._intent, days_since_delivery=days_since_delivery)
+
     # -- Payments protocol -----------------------------------------------
 
     async def quote(self, service: ServiceRef) -> Quote:
@@ -423,6 +542,7 @@ class PravaPayments:
         if amount.amount <= 0:
             msg = f"payment amount must be positive: {amount.amount}"
             raise PravaConfigError(msg)
+        self._assert_conforms(amount, ref)
 
         try:
             result = await self._client.charge(
@@ -525,6 +645,26 @@ class PravaPayments:
             "with a fresh PaymentRef."
         )
         raise PravaRefundUnsupportedError(msg)
+
+    # -- private ---------------------------------------------------------
+
+    def _assert_conforms(self, amount: Money, ref: PaymentRef) -> None:
+        """Refuse a non-conforming charge before any network call is made."""
+        if self._intent is None:
+            return
+        result = self.check_delivery(amount_minor=amount.amount)
+        if result.passed:
+            return
+        detail = "; ".join(
+            f"{c.name} (expected {c.expected}, got {c.actual})"
+            for c in result.checks
+            if not c.passed
+        )
+        msg = (
+            f"refusing to charge {ref}: the delivery does not conform to the "
+            f"certified purchase intent -- {detail}. No charge was attempted."
+        )
+        raise PravaConformanceError(msg, result)
 
     # -- lifecycle -------------------------------------------------------
 

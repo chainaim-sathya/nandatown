@@ -1,0 +1,130 @@
+# SPDX-License-Identifier: Apache-2.0
+# IntentDvP: delivery-versus-payment against a certified purchase intent.
+#
+# WHAT THIS DEMONSTRATES, AND WHY IT MATTERS
+#
+# An LLM shopping agent was asked: "find one kurti under 500 rupees in green,
+# pink or navy on libas and buy one". That sentence cannot be checked against a
+# delivery. An out-of-band certifier turns it into terms that can be --
+# allowed_colours, a price ceiling, the merchant, the quantity, a return window
+# -- and anchors them with a digest. That is the `certificate` block in the
+# snapshot this scenario reads.
+#
+# The plugin then refuses to charge unless the delivery matches those terms,
+# BEFORE any network call is made. A refused purchase leaves nothing at the
+# payment rail: no charge, no credential, nothing to reverse.
+#
+# The failure worth understanding is a CHEAPER substitution. Point this scenario
+# at the drift snapshot and the agent has settled for a maroon kurti at INR 450
+# instead of the navy one at INR 499. It is cheaper than the quote, under the
+# declineThreshold, and from the same merchant -- so every amount-based control
+# in the stack accepts it: Visa's decline threshold, the mandate cap, the card
+# network's own ceiling. All of those ask only HOW MUCH. None asks WHAT. The
+# user authorised green, pink or navy; maroon was never in scope. Comparing the
+# delivery to the certified intent is the only thing that catches it.
+#
+# RUN THE TWO CASES
+#   Conforming:      intent_snapshot -> libas-98252-2XL.json
+#                    delivery.product_id -> 98252-2XL
+#   Drifted:         intent_snapshot -> libas-98115-2XL-drift.json
+#                    delivery.product_id -> 98115-2XL
+#
+# RETURNS
+#   days_since_delivery is CONFIG, never the wall clock -- a clock read would
+#   make the verdict, and the trace, non-reproducible. Set 5 for a verdict
+#   inside the certified 30-day window, 40 for outside it. An approved verdict
+#   means the request conforms to terms agreed up front; it does NOT mean money
+#   moved. The Prava API defines no reversal endpoint, so settling an approved
+#   return happens off this rail, and the broadcast says so.
+#
+# LIVE MODE
+#   Default is `simulated`: in-process, no network, no credentials,
+#   byte-identical per seed. To settle for real, provision a mandate out of
+#   band, export PRAVA_API_KEY (never put it in this file), then set
+#   mode: live and mandate_id below. A live run is not byte-deterministic.
+
+name: prava_dvp_return_denied
+description: |
+  One buyer settles a kurti on the Prava rail only if the delivery conforms
+  to a certified purchase intent: colour within the authorised set, price
+  under the ceiling, the agreed merchant, the selected product id, and the
+  quoted amount. A non-conforming delivery is refused before any charge is
+  attempted, so nothing reaches the card network.
+
+  A return request is then judged against the same certificate's window.
+  Approved means the request conforms to terms agreed before purchase -- not
+  that a credit was issued; Prava exposes no reversal endpoint.
+
+tier: 1
+seed: 42
+
+agents:
+  count: 2
+  brain: state-machine
+  roles:
+    - name: buyer
+      count: 1
+      config: {}
+    - name: seller
+      count: 1
+      config: {}
+
+layers:
+  transport: in_memory
+  comms: nest_native
+  identity: did_key
+  registry: in_memory
+  auth: jwt
+  trust: score_average
+  payments: prava
+  coordination: contract_net
+  negotiation: alternating_offers
+  memory: blackboard
+  privacy: noop
+  datafacts: datafacts_v1
+
+task:
+  type: prava_commerce
+  config:
+    pairs: 1                     # one mandate, one charge per cycle
+    # ----- rail selection -------------------------------------------------
+    mode: simulated              # simulated | live
+    prava_env: sandbox           # sandbox | production
+    mandate_id: mdt_simulated_demo
+    # ----- money ----------------------------------------------------------
+    currency: USD
+    minor_unit_exponent: 2
+    # The certified intent. Swap to libas-98115-2XL-drift.json for the
+    # non-conforming case.
+    intent_snapshot: ./scenarios/intents/libas-98252-2XL.json
+    unit_price_minor: 4000       # fallback only, unused with a snapshot
+    cap_minor: 100000
+    overcap_minor: 99999900      # oversized on purpose -> THRESHOLD_EXCEEDED
+    # ----- IntentDvP ------------------------------------------------------
+    # Opt-in. Without this the plugin never receives the certified intent and
+    # pay() behaves exactly as it does in prava_commerce.yaml.
+    require_conformance: true
+    # What the counterparty says it is actually shipping. Change product_id to
+    # 98115-2XL (with the drift snapshot) to see the refusal.
+    delivery:
+      product_id: "98252-2XL"
+      merchant: Libas
+    # 5 -> within the certified 30-day window; 40 -> outside it.
+    days_since_delivery: 40
+    # ----- behaviour ------------------------------------------------------
+    fail_closed: true
+    timeout_s: 30.0
+    max_retries: 3
+
+failures:
+  message_drop: 0.0
+  byzantine_agents: 0.0
+
+duration: "ticks: 200"
+
+metrics:
+  - message_count
+  - agent_count
+
+output:
+  trace: ./traces/prava_dvp_return_denied.jsonl

@@ -1,0 +1,102 @@
+# SPDX-License-Identifier: Apache-2.0
+# IntentDvP -- the NON-CONFORMING case. Companion to prava_dvp.yaml.
+#
+# Identical to prava_dvp.yaml except for two lines: the intent snapshot and the
+# delivered product id. Kept as a separate file so the two cases can be run back
+# to back with no editing in between.
+#
+# THE DRIFT
+#   The user asked for "one kurti under 500 rupees in green, pink or navy on
+#   libas". Navy was unavailable, so the agent settled for a maroon kurti at
+#   INR 450 -- cheaper than the INR 499 navy one, and still under the ceiling.
+#
+#   That substitution passes EVERY amount-based control in the stack: Visa's
+#   declineThreshold (USD 5.30), the mandate cap, the card network's own
+#   ceiling. All of them ask only HOW MUCH. None asks WHAT. Maroon was never in
+#   the authorised colour set, so only the check against the certified intent
+#   catches it -- and it catches it before any network call is made.
+#
+#   The drift snapshot is HAND-WRITTEN and marked "constructed": true. It models
+#   an agent that settled for close enough; it is not the capture of a live
+#   agent run, and it does not claim to be.
+#
+# EXPECTED TRACE
+#   prava:conformance:...:result=fail:reason=colour_not_in_intent:
+#       expected=green|pink|navy:actual=maroon
+#   prava:refused:step=paid:...:code=INTENT_NONCONFORMANT
+#   ...and NO prava:paid line anywhere. Nothing reached the rail: no charge, no
+#   credential, nothing to reverse. The absence is the evidence.
+
+name: prava_dvp_drift
+description: |
+  The agent drifted: asked for green, pink or navy under INR 500 on Libas, it
+  settled for maroon at INR 450. Cheaper than the quote and under every cap,
+  so no amount-based control objects. The certified purchase intent refuses
+  the charge before it is attempted.
+
+tier: 1
+seed: 42
+
+agents:
+  count: 2
+  brain: state-machine
+  roles:
+    - name: buyer
+      count: 1
+      config: {}
+    - name: seller
+      count: 1
+      config: {}
+
+layers:
+  transport: in_memory
+  comms: nest_native
+  identity: did_key
+  registry: in_memory
+  auth: jwt
+  trust: score_average
+  payments: prava
+  coordination: contract_net
+  negotiation: alternating_offers
+  memory: blackboard
+  privacy: noop
+  datafacts: datafacts_v1
+
+task:
+  type: prava_commerce
+  config:
+    pairs: 1
+    # ----- rail selection -------------------------------------------------
+    mode: simulated
+    prava_env: sandbox
+    mandate_id: mdt_simulated_demo
+    # ----- money ----------------------------------------------------------
+    currency: USD
+    minor_unit_exponent: 2
+    intent_snapshot: ./scenarios/intents/libas-98115-2XL-drift.json
+    unit_price_minor: 4000
+    cap_minor: 100000
+    overcap_minor: 99999900
+    # ----- IntentDvP ------------------------------------------------------
+    require_conformance: true
+    delivery:
+      product_id: "98115-2XL"
+      merchant: Libas
+    days_since_delivery: 5
+    # ----- behaviour ------------------------------------------------------
+    fail_closed: true
+    timeout_s: 30.0
+    max_retries: 3
+
+failures:
+  message_drop: 0.0
+  byzantine_agents: 0.0
+
+duration: "ticks: 200"
+
+metrics:
+  - message_count
+  - agent_count
+
+output:
+  trace: ./traces/prava_dvp_drift.jsonl
