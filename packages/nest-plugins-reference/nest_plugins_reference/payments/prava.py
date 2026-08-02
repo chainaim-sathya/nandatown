@@ -173,7 +173,9 @@ class PravaPayments:
     ``api_key``                 ``$PRAVA_API_KEY``  Never put this in YAML.
     ``currency``                ``USD``        ISO 4217 code sent to Prava.
     ``minor_unit_exponent``     ``2``          0 for JPY/KRW.
-    ``unit_price_minor``        ``4_000``      Price returned by ``quote``.
+    ``unit_price_minor``        ``4_000``      Fallback price when no price book.
+    ``price_book``              ``None``       ``service_ref -> minor units``.
+    ``intent_digest``           ``None``       Snapshot digest, stamped on quotes.
     ``cap_minor``               ``100_000``    Simulated-mode mandate ceiling.
     ``fail_closed``             ``True``       See below.
     ``timeout_s``               ``30.0``       Live transport only.
@@ -214,6 +216,8 @@ class PravaPayments:
         currency: str = "USD",
         minor_unit_exponent: int = 2,
         unit_price_minor: int = 4_000,
+        price_book: dict[str, int] | None = None,
+        intent_digest: str | None = None,
         cap_minor: int = 100_000,
         fail_closed: bool = True,
         timeout_s: float = 30.0,
@@ -242,6 +246,8 @@ class PravaPayments:
         self._currency = currency
         self._exponent = minor_unit_exponent
         self._unit_price_minor = unit_price_minor
+        self._price_book = dict(price_book) if price_book is not None else None
+        self._intent_digest = intent_digest
         self._fail_closed = fail_closed
         self._authorization_code = authorization_code
         self._receipts: dict[PaymentRef, Receipt] = receipts if receipts is not None else {}
@@ -347,20 +353,47 @@ class PravaPayments:
     # -- Payments protocol -----------------------------------------------
 
     async def quote(self, service: ServiceRef) -> Quote:
-        """Return the configured unit price. Local; Prava has no quote endpoint.
+        """Price ``service`` from the price book, or fall back to the unit price.
 
-        The price is a plugin config value rather than a network read because
-        Prava prices nothing -- it authorizes and settles. Keeping the quote
-        local also keeps ``quote`` deterministic under replay.
+        No network call: Prava prices nothing -- it authorizes and settles --
+        and a live catalogue read would make ``quote`` non-deterministic under
+        replay. When a ``price_book`` is supplied it is a *frozen* mapping built
+        from purchase-intent snapshots, so the price an upstream agent agreed to
+        is the price this method returns.
+
+        An unknown ``service`` raises rather than falling back. A silent
+        fallback would quote the default unit price for an item nobody priced,
+        and the trace would look healthy while the wrong amount was charged.
 
         Example::
 
-            q = await payments.quote(ServiceRef("svc-1"))
+            q = await payments.quote(ServiceRef("libas:98252-2XL"))
+
+        Raises:
+            PravaConfigError: If a price book is configured and ``service`` is
+                not in it.
         """
+        metadata = {"source": "prava_plugin_price_book", "mode": self._mode}
+        if self._price_book is None:
+            amount_minor = self._unit_price_minor
+        else:
+            key = str(service)
+            if key not in self._price_book:
+                known = ", ".join(sorted(self._price_book)) or "<empty>"
+                msg = (
+                    f"no price for service {key!r} in the purchase-intent price book. "
+                    f"Known refs: {known}. The scenario asked to quote an item that no "
+                    "snapshot priced -- fix the service ref or capture a snapshot for it."
+                )
+                raise PravaConfigError(msg)
+            amount_minor = self._price_book[key]
+            metadata["source"] = "prava_intent_snapshot"
+        if self._intent_digest is not None:
+            metadata["intent_digest"] = self._intent_digest
         return Quote(
             service=service,
-            price=Money(amount=self._unit_price_minor, currency=self._currency),
-            metadata={"source": "prava_plugin_price_book", "mode": self._mode},
+            price=Money(amount=amount_minor, currency=self._currency),
+            metadata=metadata,
         )
 
     async def pay(self, to: AgentId, amount: Money, ref: PaymentRef) -> Receipt:

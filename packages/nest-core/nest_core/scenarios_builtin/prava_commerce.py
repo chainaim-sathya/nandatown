@@ -39,7 +39,10 @@ Example::
 
 from __future__ import annotations
 
-from typing import Any
+import hashlib
+import json
+from pathlib import Path
+from typing import Any, cast
 
 from nest_core.scenario import ScenarioConfig
 from nest_core.sim.agent import AgentContext, StateMachineAgent
@@ -90,6 +93,59 @@ Example::
 """
 
 
+def _load_intent_snapshot(path: str) -> tuple[str, int, str]:
+    """Read a purchase-intent snapshot and return ``(service_ref, minor, digest)``.
+
+    Parsed with the standard library rather than
+    ``nest_plugins_reference.payments.prava_intent`` because ``nest_core`` must
+    not import the plugin package. That module remains the canonical validated
+    loader for library consumers and for the plugin's own tests; this reads the
+    three fields the scenario needs and lets the plugin reject anything wrong.
+
+    Example::
+
+        ref, minor, digest = _load_intent_snapshot("scenarios/intents/x.json")
+
+    Raises:
+        ValueError: If the file is unreadable, is not a JSON object, or lacks
+            ``item.service_ref`` or ``settlement.amount_minor``.
+    """
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+        payload: Any = json.loads(text)
+    except (OSError, json.JSONDecodeError) as exc:
+        msg = f"cannot read purchase-intent snapshot {path!r}: {exc}"
+        raise ValueError(msg) from exc
+    if not isinstance(payload, dict):
+        msg = f"purchase-intent snapshot {path!r} must contain a JSON object"
+        raise ValueError(msg)
+    data = cast("dict[str, Any]", payload)
+    item = data.get("item")
+    settlement = data.get("settlement")
+    if not isinstance(item, dict) or not isinstance(settlement, dict):
+        msg = f"purchase-intent snapshot {path!r} needs 'item' and 'settlement' objects"
+        raise ValueError(msg)
+    service_ref = cast("dict[str, Any]", item).get("service_ref")
+    amount_minor = cast("dict[str, Any]", settlement).get("amount_minor")
+    if not isinstance(service_ref, str) or not service_ref.strip():
+        msg = f"purchase-intent snapshot {path!r} has no usable item.service_ref"
+        raise ValueError(msg)
+    if isinstance(amount_minor, bool) or not isinstance(amount_minor, int) or amount_minor <= 0:
+        msg = (
+            f"purchase-intent snapshot {path!r} settlement.amount_minor must be a "
+            f"positive integer, got {amount_minor!r}"
+        )
+        raise ValueError(msg)
+    canonical = json.dumps(
+        data,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return service_ref, amount_minor, digest
+
+
 def _emit(fields: dict[str, str | int]) -> bytes:
     """Build a ``prava:<kind>:k=v:...`` broadcast payload.
 
@@ -120,6 +176,7 @@ class PravaBuyerAgent(StateMachineAgent):
             amount_minor=4_000,
             overcap_minor=99_999_900,
             currency="USD",
+            service_ref="libas:98252-2XL",
         )
     """
 
@@ -131,6 +188,7 @@ class PravaBuyerAgent(StateMachineAgent):
         amount_minor: int,
         overcap_minor: int,
         currency: str,
+        service_ref: str | None = None,
     ) -> None:
         self._id = agent_id
         self._seller = seller
@@ -139,6 +197,21 @@ class PravaBuyerAgent(StateMachineAgent):
         self._amount_minor = amount_minor
         self._overcap_minor = overcap_minor
         self._currency = currency
+        self._service_ref = service_ref if service_ref else f"svc-{seller}"
+        self._quoted_minor: int | None = None
+
+    def _charge_minor(self) -> int:
+        """Amount to charge: the quoted price once quoted, else the configured one.
+
+        The quote is authoritative. Charging a separately configured constant
+        would let the quoted price and the settled amount drift apart silently,
+        which is exactly the bug an agentic payment rail must not have.
+
+        Example::
+
+            minor = agent._charge_minor()
+        """
+        return self._quoted_minor if self._quoted_minor is not None else self._amount_minor
 
     async def on_start(self, ctx: AgentContext) -> None:
         await ctx.schedule(_TICK_QUOTE, _OP_QUOTE)
@@ -151,23 +224,31 @@ class PravaBuyerAgent(StateMachineAgent):
     async def on_message(self, ctx: AgentContext, sender: AgentId, payload: bytes) -> None:
         payments = ctx.plugins["payments"]
         mode = str(getattr(payments, "mode", "unknown"))
-        money = Money(amount=self._amount_minor, currency=self._currency)
 
         if payload == _OP_QUOTE:
-            quote = await payments.quote(ServiceRef(f"svc-{self._seller}"))
-            await ctx.broadcast(
-                _emit(
-                    {
-                        "kind": "quoted",
-                        "buyer": str(self._id),
-                        "service": str(quote.service),
-                        "price": int(quote.price.amount),
-                        "currency": str(quote.price.currency),
-                        "mode": mode,
-                    }
-                )
-            )
+            quote = await payments.quote(ServiceRef(self._service_ref))
+            self._quoted_minor = int(quote.price.amount)
+            fields: dict[str, str | int] = {
+                "kind": "quoted",
+                "buyer": str(self._id),
+                "service": str(quote.service),
+                "price": int(quote.price.amount),
+                "currency": str(quote.price.currency),
+            }
+            metadata = getattr(quote, "metadata", None)
+            if isinstance(metadata, dict):
+                meta = cast("dict[str, Any]", metadata)
+                source = meta.get("source")
+                if source is not None:
+                    fields["source"] = str(source)
+                digest = meta.get("intent_digest")
+                if digest is not None:
+                    fields["intent"] = str(digest)[:12]
+            fields["mode"] = mode
+            await ctx.broadcast(_emit(fields))
             return
+
+        money = Money(amount=self._charge_minor(), currency=self._currency)
 
         if payload == _OP_PAY:
             await self._attempt_pay(ctx, money, self._ref, mode, kind="paid")
@@ -309,9 +390,16 @@ def prava_commerce_factory(
     which is required in ``live`` mode):
 
     ``pairs``, ``mandate_id``, ``mode``, ``prava_env``, ``currency``,
-    ``minor_unit_exponent``, ``unit_price_minor``, ``cap_minor``,
-    ``overcap_minor``, ``fail_closed``, ``timeout_s``, ``max_retries``,
-    ``authorization_code``.
+    ``minor_unit_exponent``, ``unit_price_minor``, ``intent_snapshot``,
+    ``cap_minor``, ``overcap_minor``, ``fail_closed``, ``timeout_s``,
+    ``max_retries``, ``authorization_code``.
+
+    ``intent_snapshot`` is a path to a frozen purchase-intent file describing an
+    item an upstream LLM shopper selected. When present it supplies the service
+    ref the buyer quotes and the price book the plugin prices from, so the
+    amount charged is the amount that shopper agreed to rather than a constant
+    in YAML. When absent the scenario keeps its synthetic ``svc-<seller>`` ref
+    and ``unit_price_minor``.
 
     The API key is never read from YAML -- the plugin pulls it from
     ``PRAVA_API_KEY``.
@@ -333,6 +421,14 @@ def prava_commerce_factory(
     overcap_minor = int(task_config.get("overcap_minor", DEFAULT_OVERCAP_MINOR))
     currency = str(task_config.get("currency", "USD"))
 
+    snapshot_path = task_config.get("intent_snapshot")
+    service_ref: str | None = None
+    price_book: dict[str, int] | None = None
+    intent_digest: str | None = None
+    if snapshot_path:
+        service_ref, unit_price_minor, intent_digest = _load_intent_snapshot(str(snapshot_path))
+        price_book = {service_ref: unit_price_minor}
+
     plugin_kwargs: dict[str, Any] = {
         "mandate_id": str(task_config.get("mandate_id", "mdt_simulated_demo")),
         "mode": str(task_config.get("mode", "simulated")),
@@ -340,6 +436,8 @@ def prava_commerce_factory(
         "currency": currency,
         "minor_unit_exponent": int(task_config.get("minor_unit_exponent", 2)),
         "unit_price_minor": unit_price_minor,
+        "price_book": price_book,
+        "intent_digest": intent_digest,
         "cap_minor": int(task_config.get("cap_minor", 100_000)),
         "fail_closed": bool(task_config.get("fail_closed", True)),
         "timeout_s": float(task_config.get("timeout_s", 30.0)),
@@ -363,6 +461,7 @@ def prava_commerce_factory(
             amount_minor=unit_price_minor,
             overcap_minor=overcap_minor,
             currency=currency,
+            service_ref=service_ref,
         )
         agents[seller_id] = PravaSellerAgent(seller_id)
 

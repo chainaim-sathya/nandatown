@@ -26,6 +26,10 @@ description: |
   charge (refused with THRESHOLD_EXCEEDED) -> request a refund (raises,
   because the Prava API defines no refund endpoint).
 
+  The quoted price comes from a frozen purchase-intent snapshot rather than
+  from this file, so the amount settled is the amount an upstream shopping
+  agent actually agreed to for a specific catalogue item.
+
 tier: 1
 seed: 42
 
@@ -65,7 +69,17 @@ task:
     # ----- money ----------------------------------------------------------
     currency: USD
     minor_unit_exponent: 2       # 0 for zero-decimal currencies (JPY, KRW)
-    unit_price_minor: 4000       # "40.00"
+    # The price is NOT set here. It comes from a frozen purchase-intent
+    # snapshot: the record of an item an upstream LLM shopper selected from a
+    # live merchant catalogue, with the listed price, the settlement amount and
+    # the FX rate that connects them. Product discovery is non-deterministic and
+    # networked, so it happens out of band and its result is written down; the
+    # scenario reads the file and never queries a catalogue. The buyer quotes
+    # the snapshot's service_ref and pays exactly what the quote returned.
+    # Remove this line to fall back to the synthetic svc-<seller> ref priced at
+    # unit_price_minor below.
+    intent_snapshot: ./scenarios/intents/libas-98252-2XL.json
+    unit_price_minor: 4000       # "40.00"; fallback only, unused with a snapshot
     cap_minor: 100000            # "1000.00"; simulated-mode mandate ceiling
     overcap_minor: 99999900      # oversized on purpose -> THRESHOLD_EXCEEDED
     # ----- behaviour ------------------------------------------------------
