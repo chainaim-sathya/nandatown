@@ -253,8 +253,29 @@ class PurchaseIntent:
     colour: str | None = None
     size: str | None = None
     constructed: bool = False
+    intent_id: str | None = None
     certificate: Certificate | None = None
     visa: VisaIntent | None = field(default=None)
+
+    @property
+    def mandate_digest(self) -> str | None:
+        """Digest over the certified terms alone, or ``None`` without a certificate.
+
+        Distinct from :attr:`digest`, which covers the whole snapshot including
+        the selection. The terms are fixed when the intent is declared and never
+        change afterwards, so two snapshots recording different selections
+        against the same request share this value while their full digests
+        differ. That difference is the evidence that the terms were not rewritten
+        to fit whatever an agent happened to find.
+
+        Derived rather than stored: a literal in the file could disagree with the
+        terms it claims to cover.
+
+        Example::
+
+            assert conforming.mandate_digest == drifted.mandate_digest
+        """
+        return self.certificate.digest if self.certificate is not None else None
 
     @property
     def converted(self) -> bool:
@@ -559,6 +580,7 @@ def parse_intent(payload: dict[str, Any], *, expected_schema: str = SCHEMA_V1) -
         colour=_optional_str(item, "colour"),
         size=_optional_str(item, "size"),
         constructed=bool(payload.get("constructed", False)),
+        intent_id=_optional_str(payload, "intent_id"),
         certificate=_parse_certificate(payload),
         visa=_parse_visa_intent(payload, settlement_exponent),
     )

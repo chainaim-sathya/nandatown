@@ -97,18 +97,23 @@ Example::
 """
 
 
-def _load_intent_snapshot(path: str) -> tuple[str, int, str]:
-    """Read a purchase-intent snapshot and return ``(service_ref, minor, digest)``.
+def _load_intent_snapshot(path: str) -> tuple[str, int, str, str | None, str | None]:
+    """Read a snapshot; return ref, minor units, digest, intent id and mandate digest.
+
+    The **mandate digest** covers only ``certificate.committed_reference`` -- the
+    terms. Those are fixed when the intent is declared and never change, so two
+    snapshots recording different selections against one request share this
+    value while their full digests differ. Stamped into the trace, it is the
+    evidence that the terms were not rewritten to fit what an agent found.
 
     Parsed with the standard library rather than
     ``nest_plugins_reference.payments.prava_intent`` because ``nest_core`` must
     not import the plugin package. That module remains the canonical validated
-    loader for library consumers and for the plugin's own tests; this reads the
-    three fields the scenario needs and lets the plugin reject anything wrong.
+    loader; the canonical JSON form here is identical, so the digests match.
 
     Example::
 
-        ref, minor, digest = _load_intent_snapshot("scenarios/intents/x.json")
+        ref, minor, digest, intent_id, mandate = _load_intent_snapshot(path)
 
     Raises:
         ValueError: If the file is unreadable, is not a JSON object, or lacks
@@ -147,7 +152,23 @@ def _load_intent_snapshot(path: str) -> tuple[str, int, str]:
         ensure_ascii=False,
     )
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    return service_ref, amount_minor, digest
+
+    mandate_digest: str | None = None
+    certificate = data.get("certificate")
+    if isinstance(certificate, dict):
+        committed = cast("dict[str, Any]", certificate).get("committed_reference")
+        if isinstance(committed, dict):
+            mandate_canonical = json.dumps(
+                cast("dict[str, Any]", committed),
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+            mandate_digest = hashlib.sha256(mandate_canonical.encode("utf-8")).hexdigest()
+
+    raw_id = data.get("intent_id")
+    intent_id = raw_id if isinstance(raw_id, str) and raw_id.strip() else None
+    return service_ref, amount_minor, digest, intent_id, mandate_digest
 
 
 def _emit(fields: dict[str, str | int]) -> bytes:
@@ -196,6 +217,9 @@ class PravaBuyerAgent(StateMachineAgent):
         delivery_product_id: str | None = None,
         delivery_merchant: str | None = None,
         days_since_delivery: int | None = None,
+        intent_digest: str | None = None,
+        intent_id: str | None = None,
+        mandate_digest: str | None = None,
     ) -> None:
         self._id = agent_id
         self._seller = seller
@@ -208,8 +232,36 @@ class PravaBuyerAgent(StateMachineAgent):
         self._delivery_product_id = delivery_product_id
         self._delivery_merchant = delivery_merchant
         self._days_since_delivery = days_since_delivery
+        self._intent_digest = intent_digest
+        self._intent_id = intent_id
+        self._mandate_digest = mandate_digest
         self._quoted_minor: int | None = None
         self._paid = False
+
+    def _stamped(self, fields: dict[str, str | int]) -> bytes:
+        """Attach the intent identifiers to ``fields`` and encode the broadcast.
+
+        Every event this agent emits carries the same three values, so one grep
+        over a trace returns the whole journey -- quote, delivery, conformance,
+        settlement, verification, return -- rather than a single line the reader
+        has to trust the rest of the run agreed with.
+
+        ``mandate`` is the digest of the terms alone and is identical across
+        snapshots that record different selections against one request;
+        ``intent`` covers the selection too and differs. Both are content
+        derived, so an edit made mid-flight would show up as a mismatch.
+
+        Example::
+
+            await ctx.broadcast(agent._stamped({"kind": "paid"}))
+        """
+        if self._intent_id is not None:
+            fields["intent_id"] = self._intent_id
+        if self._intent_digest is not None:
+            fields["intent"] = self._intent_digest[:12]
+        if self._mandate_digest is not None:
+            fields["mandate"] = self._mandate_digest[:12]
+        return _emit(fields)
 
     def _charge_minor(self) -> int:
         """Amount to charge: the quoted price once quoted, else the configured one.
@@ -256,11 +308,8 @@ class PravaBuyerAgent(StateMachineAgent):
                 source = meta.get("source")
                 if source is not None:
                     fields["source"] = str(source)
-                digest = meta.get("intent_digest")
-                if digest is not None:
-                    fields["intent"] = str(digest)[:12]
             fields["mode"] = mode
-            await ctx.broadcast(_emit(fields))
+            await ctx.broadcast(self._stamped(fields))
             return
 
         money = Money(amount=self._charge_minor(), currency=self._currency)
@@ -327,7 +376,7 @@ class PravaBuyerAgent(StateMachineAgent):
             "amount": int(self._charge_minor()),
             "mode": mode,
         }
-        await ctx.broadcast(_emit(fields))
+        await ctx.broadcast(self._stamped(fields))
 
         check = getattr(payments, "check_delivery", None)
         if check is None:
@@ -345,7 +394,7 @@ class PravaBuyerAgent(StateMachineAgent):
                 verdict["actual"] = str(getattr(check_item, "actual", ""))
                 break
         verdict["mode"] = mode
-        await ctx.broadcast(_emit(verdict))
+        await ctx.broadcast(self._stamped(verdict))
 
     async def _request_return(self, ctx: AgentContext, mode: str) -> None:
         """Ask whether a return falls inside the certified window.
@@ -365,7 +414,7 @@ class PravaBuyerAgent(StateMachineAgent):
             return
         if not self._paid:
             await ctx.broadcast(
-                _emit(
+                self._stamped(
                     {
                         "kind": "return",
                         "ref": str(self._ref),
@@ -394,7 +443,7 @@ class PravaBuyerAgent(StateMachineAgent):
         if approved:
             fields["settlement"] = "unavailable_on_rail"
         fields["mode"] = mode
-        await ctx.broadcast(_emit(fields))
+        await ctx.broadcast(self._stamped(fields))
 
     async def _attempt_pay(
         self,
@@ -411,7 +460,7 @@ class PravaBuyerAgent(StateMachineAgent):
             raise
         except (RuntimeError, ValueError) as exc:
             await ctx.broadcast(
-                _emit(
+                self._stamped(
                     {
                         "kind": "refused",
                         "step": kind,
@@ -425,7 +474,7 @@ class PravaBuyerAgent(StateMachineAgent):
             )
             return
         await ctx.broadcast(
-            _emit(
+            self._stamped(
                 {
                     "kind": kind,
                     "ref": str(receipt.ref),
@@ -447,7 +496,7 @@ class PravaBuyerAgent(StateMachineAgent):
             await payments.refund(self._ref)
         except NotImplementedError as exc:
             await ctx.broadcast(
-                _emit(
+                self._stamped(
                     {
                         "kind": "refund_unsupported",
                         "ref": str(self._ref),
@@ -459,10 +508,12 @@ class PravaBuyerAgent(StateMachineAgent):
             return
         except (RuntimeError, ValueError):
             await ctx.broadcast(
-                _emit({"kind": "refund_failed", "ref": str(self._ref), "mode": mode})
+                self._stamped({"kind": "refund_failed", "ref": str(self._ref), "mode": mode})
             )
             return
-        await ctx.broadcast(_emit({"kind": "refunded", "ref": str(self._ref), "mode": mode}))
+        await ctx.broadcast(
+            self._stamped({"kind": "refunded", "ref": str(self._ref), "mode": mode})
+        )
 
 
 def _false(_ref: PaymentRef) -> bool:
@@ -551,8 +602,16 @@ def prava_commerce_factory(
     service_ref: str | None = None
     price_book: dict[str, int] | None = None
     intent_digest: str | None = None
+    intent_id: str | None = None
+    mandate_digest: str | None = None
     if snapshot_path:
-        service_ref, unit_price_minor, intent_digest = _load_intent_snapshot(str(snapshot_path))
+        (
+            service_ref,
+            unit_price_minor,
+            intent_digest,
+            intent_id,
+            mandate_digest,
+        ) = _load_intent_snapshot(str(snapshot_path))
         price_book = {service_ref: unit_price_minor}
 
     require_conformance = bool(task_config.get("require_conformance", False))
@@ -602,6 +661,9 @@ def prava_commerce_factory(
             delivery_product_id=(str(delivery_product_id) if delivery_product_id else None),
             delivery_merchant=(str(delivery_merchant) if delivery_merchant else None),
             days_since_delivery=days_since_delivery,
+            intent_digest=intent_digest,
+            intent_id=intent_id,
+            mandate_digest=mandate_digest,
         )
         agents[seller_id] = PravaSellerAgent(seller_id)
 

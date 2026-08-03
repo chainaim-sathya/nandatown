@@ -1,5 +1,6 @@
 {
   "schema": "nest.prava.intent/v1",
+  "intent_id": "int_2026-08-02_libas_kurti_001",
   "captured_at": "2026-08-02T06:52:43Z",
   "source": "openclaw agent 'main', session libas-test, openai/gpt-5.5, product discovery via prava shop against https://www.libas.in/api/ucp/mcp",
   "merchant": {

@@ -1,5 +1,6 @@
 {
   "schema": "nest.prava.intent/v1",
+  "intent_id": "int_2026-08-02_libas_kurti_001",
   "captured_at": "2026-08-02T20:14:11Z",
   "source": "CONSTRUCTED drift case, hand-written. Models an agent that could not find the requested colour in stock and settled for a cheaper near-match. Not the output of a live agent run.",
   "constructed": true,
