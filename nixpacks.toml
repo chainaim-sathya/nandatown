@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0
+# Nixpacks build plan for the Prava skill service.
+#
+# Use with Railway's Root Directory set to the REPO ROOT (not apps/skill-service):
+# the service imports nest_core and nest_plugins_reference from packages/, and
+# reads the purchase-intent snapshots from scenarios/intents/. Railway only
+# uploads what is under the root directory, so pointing at apps/skill-service
+# would leave both behind.
+#
+# This does NOT use uv. The service installs its own small requirements file and
+# imports the two workspace packages from source, so uv.lock is never touched and
+# `make ci-local` is unaffected.
+#
+# The dashboard at apps/nest-dashboard has its own railway.json and nixpacks.toml
+# and is meant to run as a SEPARATE Railway service with Root Directory set to
+# apps/nest-dashboard. This file does not affect it.
+
+providers = ["python"]
+
+[phases.setup]
+nixPkgs = ["python312"]
+
+[phases.install]
+cmds = [
+  "python -m pip install --upgrade pip",
+  "python -m pip install -r apps/skill-service/requirements.txt",
+]
+
+[start]
+cmd = "python -m uvicorn app:app --app-dir apps/skill-service --host 0.0.0.0 --port $PORT"

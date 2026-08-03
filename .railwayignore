@@ -1,3 +1,15 @@
+# Excluded from the Railway build context.
+#
+# CHANGED for the skill service: /packages and /scenarios used to be excluded
+# here. They cannot be. The service imports the Prava plugin from
+# packages/nest-plugins-reference and packages/nest-core, and reads the frozen
+# purchase-intent snapshots from scenarios/intents/. Excluding them was correct
+# when the only thing deployed from this repo was the Node dashboard; it is not
+# correct now.
+#
+# The dashboard runs as a separate Railway service with Root Directory set to
+# apps/nest-dashboard, and uses its own .railwayignore in that folder.
+
 .venv
 .claude
 .git
@@ -6,10 +18,7 @@ node_modules
 /traces
 __pycache__
 *.pyc
-/packages
-/scripts
 /docs
-/scenarios
 /templates
 /examples
 /NandaTown.png

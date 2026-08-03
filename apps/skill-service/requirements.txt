@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+# Runtime dependencies for the skill service only.
+#
+# Kept separate from the uv workspace on purpose: adding fastapi to the root
+# pyproject.toml would change uv.lock, and `make ci-local` runs `uv sync` over
+# that lock. This file installs the web layer without touching the library
+# packages at all.
+#
+# nest_core.types uses pydantic; prava_client uses httpx. Both are listed here
+# because this service imports the packages from source rather than installing
+# them, so their own dependency metadata is never read.
+
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic>=2.7
+httpx>=0.27
